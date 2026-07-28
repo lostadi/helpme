@@ -1,0 +1,721 @@
+#!/usr/bin/env O
+# helpme system — machine profile, package managers, and "how do I …" commands.
+# Makes the host itself readable: what am I on, how do I install things,
+# and what are the most important commands for this environment.
+#
+# Env:
+#   HELPME_QUERY — optional section: machine | packages | do | files |
+#                  network | process | edit | termux | all (default)
+
+python^(
+import os, platform, shutil, socket, subprocess, time
+from pathlib import Path
+
+query = (os.environ.get("HELPME_QUERY") or "all").strip().lower()
+if query in ("", "system", "start", "home", "guide"):
+    query = "all"
+
+SEP = "─" * 72
+lines = []
+
+
+def section(title):
+    lines.append("")
+    lines.append(f"\033[1;33m{title}\033[0m")
+    lines.append(SEP)
+
+
+def row(label, value, width=18):
+    lines.append(f"  \033[1m{label:<{width}}\033[0m {value}")
+
+
+def cmd(example, meaning=""):
+    if meaning:
+        lines.append(f"  \033[1;32m{example}\033[0m")
+        lines.append(f"      \033[90m{meaning}\033[0m")
+    else:
+        lines.append(f"  \033[1;32m{example}\033[0m")
+
+
+def run(argv, timeout=3):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or r.stderr or "").strip()
+    except Exception:
+        return ""
+
+
+def which(name):
+    return shutil.which(name)
+
+
+def is_termux():
+    p = os.environ.get("PREFIX", "")
+    return bool(p and "com.termux" in p)
+
+
+def human_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024:
+            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
+        n /= 1024.0
+    return f"{n:.1f}P"
+
+
+def mem_info():
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                parts = v.split()
+                if parts:
+                    # values are kB
+                    info[k] = int(parts[0]) * 1024
+    except OSError:
+        pass
+    return info
+
+
+def disk_home():
+    try:
+        u = os.statvfs(os.path.expanduser("~"))
+        total = u.f_frsize * u.f_blocks
+        free = u.f_frsize * u.f_bavail
+        used = total - free
+        return total, used, free
+    except OSError:
+        return None
+
+
+def loadavg():
+    try:
+        return os.getloadavg()
+    except (OSError, AttributeError):
+        return None
+
+
+def android_prop(key):
+    p = which("getprop")
+    if not p:
+        return ""
+    return run([p, key], timeout=2)
+
+
+TERMUX = is_termux()
+want_all = query in ("all", "full")
+
+
+def show_machine():
+    section("Machine")
+    row("Hostname", socket.gethostname())
+    row("OS", f"{platform.system()} {platform.release()}")
+    row("Kernel", platform.version()[:60] + ("…" if len(platform.version()) > 60 else ""))
+    row("Arch", platform.machine())
+    row("Python", platform.python_version())
+    row("User", os.environ.get("USER") or os.environ.get("LOGNAME") or "?")
+    row("Home", os.path.expanduser("~"))
+    row("Shell", os.environ.get("SHELL", "(unset)"))
+    row("cwd", os.getcwd())
+
+    if TERMUX:
+        row("Environment", "\033[1;36mTermux (Android)\033[0m")
+        row("PREFIX", os.environ.get("PREFIX", ""))
+        model = android_prop("ro.product.model") or android_prop("ro.product.device")
+        android = android_prop("ro.build.version.release")
+        if model:
+            row("Device", model)
+        if android:
+            row("Android", android)
+    else:
+        # os-release if present
+        for path in ("/etc/os-release", "/usr/lib/os-release"):
+            if os.path.isfile(path):
+                data = {}
+                try:
+                    with open(path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if "=" in line and not line.startswith("#"):
+                                k, v = line.split("=", 1)
+                                data[k] = v.strip().strip('"')
+                except OSError:
+                    pass
+                if data.get("PRETTY_NAME"):
+                    row("Distro", data["PRETTY_NAME"])
+                break
+
+    mem = mem_info()
+    if mem:
+        total = mem.get("MemTotal", 0)
+        avail = mem.get("MemAvailable", mem.get("MemFree", 0))
+        row("RAM", f"{human_bytes(avail)} free / {human_bytes(total)} total")
+    disk = disk_home()
+    if disk:
+        total, used, free = disk
+        pct = int(100 * used / total) if total else 0
+        row("Home disk", f"{human_bytes(free)} free / {human_bytes(total)} total ({pct}% used)")
+    la = loadavg()
+    if la:
+        row("Load avg", f"{la[0]:.2f}  {la[1]:.2f}  {la[2]:.2f}")
+
+    # network identity (no secrets)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.3)
+        s.connect(("1.1.1.1", 80))
+        row("Primary IP", s.getsockname()[0])
+        s.close()
+    except Exception:
+        row("Primary IP", "(offline or unknown)")
+
+
+# --- Package manager catalog (detect + teach) --- #
+# Each: id, detect (callable→bool or path), title, notes, commands[(cmd, why)]
+def pm_catalog():
+    entries = []
+
+    def add(pid, title, present, notes, commands):
+        entries.append({
+            "id": pid,
+            "title": title,
+            "present": bool(present),
+            "path": present if isinstance(present, str) else (which(pid) or ""),
+            "notes": notes,
+            "commands": commands,
+        })
+
+    if TERMUX or which("pkg"):
+        add(
+            "pkg",
+            "pkg — Termux packages",
+            which("pkg"),
+            "Main package manager on Termux. Prefer pkg over raw apt.",
+            [
+                ("pkg update && pkg upgrade", "refresh lists and upgrade everything"),
+                ("pkg search <name>", "find packages by name/keyword"),
+                ("pkg install <name>", "install a package"),
+                ("pkg uninstall <name>", "remove a package"),
+                ("pkg list-installed", "what you already have"),
+                ("pkg show <name>", "package details / depends"),
+                ("pkg files <name>", "files owned by a package"),
+                ("pkg reinstall <name>", "reinstall (fix broken files)"),
+                ("termux-change-repo", "switch mirror if downloads fail"),
+            ],
+        )
+
+    if which("apt") or which("apt-get"):
+        sudo = "" if TERMUX else "sudo "
+        add(
+            "apt",
+            "apt — Debian/Ubuntu packages" + (" (under Termux)" if TERMUX else ""),
+            which("apt") or which("apt-get"),
+            ("On Termux, use pkg (wraps apt). " if TERMUX else "")
+            + "Classic Debian package manager.",
+            [
+                (f"{sudo}apt update && {sudo}apt upgrade", "update package lists + upgrade"),
+                (f"{sudo}apt search <name>", "search"),
+                (f"{sudo}apt install <name>", "install"),
+                (f"{sudo}apt remove <name>", "remove"),
+                (f"{sudo}apt autoremove", "drop unused dependencies"),
+                ("apt show <name>", "details (no root)"),
+                ("dpkg -l | head", "list installed (dpkg)"),
+            ],
+        )
+
+    if which("brew"):
+        add(
+            "brew",
+            "Homebrew — macOS / Linux packages",
+            which("brew"),
+            "User-level packages; no root required.",
+            [
+                ("brew update && brew upgrade", "refresh + upgrade"),
+                ("brew search <name>", "search"),
+                ("brew install <name>", "install formula"),
+                ("brew install --cask <name>", "install GUI app (macOS)"),
+                ("brew uninstall <name>", "remove"),
+                ("brew list", "installed formulae"),
+                ("brew info <name>", "details"),
+                ("brew doctor", "diagnose brew itself"),
+            ],
+        )
+
+    if which("dnf"):
+        add(
+            "dnf",
+            "dnf — Fedora / RHEL",
+            which("dnf"),
+            "Modern Fedora package manager.",
+            [
+                ("sudo dnf upgrade", "upgrade system"),
+                ("dnf search <name>", "search"),
+                ("sudo dnf install <name>", "install"),
+                ("sudo dnf remove <name>", "remove"),
+                ("dnf info <name>", "details"),
+                ("dnf list installed", "installed packages"),
+            ],
+        )
+
+    if which("pacman"):
+        add(
+            "pacman",
+            "pacman — Arch Linux",
+            which("pacman"),
+            "Arch package manager. -S install, -R remove, -Syu full upgrade.",
+            [
+                ("sudo pacman -Syu", "sync DBs + full system upgrade"),
+                ("pacman -Ss <name>", "search"),
+                ("sudo pacman -S <name>", "install"),
+                ("sudo pacman -Rns <name>", "remove + unused deps"),
+                ("pacman -Qi <name>", "info on installed"),
+                ("pacman -Q | wc -l", "count installed"),
+            ],
+        )
+
+    if which("apk"):
+        add(
+            "apk",
+            "apk — Alpine Linux",
+            which("apk"),
+            "Alpine package manager.",
+            [
+                ("sudo apk update && sudo apk upgrade", "update + upgrade"),
+                ("apk search <name>", "search"),
+                ("sudo apk add <name>", "install"),
+                ("sudo apk del <name>", "remove"),
+                ("apk info <name>", "details"),
+            ],
+        )
+
+    if which("zypper"):
+        add(
+            "zypper",
+            "zypper — openSUSE",
+            which("zypper"),
+            "openSUSE package manager.",
+            [
+                ("sudo zypper refresh && sudo zypper update", "refresh + update"),
+                ("zypper search <name>", "search"),
+                ("sudo zypper install <name>", "install"),
+                ("sudo zypper remove <name>", "remove"),
+            ],
+        )
+
+    if which("xbps-install"):
+        add(
+            "xbps",
+            "xbps — Void Linux",
+            which("xbps-install"),
+            "Void Linux package manager.",
+            [
+                ("sudo xbps-install -Su", "sync + update"),
+                ("xbps-query -Rs <name>", "search"),
+                ("sudo xbps-install <name>", "install"),
+                ("sudo xbps-remove -R <name>", "remove + orphans"),
+            ],
+        )
+
+    if which("nix") or which("nix-env"):
+        add(
+            "nix",
+            "Nix — declarative packages",
+            which("nix") or which("nix-env"),
+            "Reproducible packages; often user-level.",
+            [
+                ("nix search nixpkgs <name>", "search (flakes)"),
+                ("nix profile install nixpkgs#<name>", "install to profile"),
+                ("nix-env -iA nixpkgs.<name>", "classic install"),
+                ("nix-env -q", "list installed"),
+            ],
+        )
+
+    # Language / tooling package managers (always useful when present)
+    if which("pip") or which("pip3"):
+        pip = "pip3" if which("pip3") else "pip"
+        add(
+            "pip",
+            f"{pip} — Python packages",
+            which(pip),
+            "User Python libs. Prefer venv for projects.",
+            [
+                (f"{pip} install --user <pkg>", "install for your user"),
+                (f"{pip} install <pkg>", "install (venv or system)"),
+                (f"{pip} uninstall <pkg>", "remove"),
+                (f"{pip} list", "installed packages"),
+                (f"{pip} show <pkg>", "details"),
+                ("python -m venv .venv && source .venv/bin/activate", "project virtualenv"),
+            ],
+        )
+
+    if which("npm"):
+        add(
+            "npm",
+            "npm — Node.js packages",
+            which("npm"),
+            "JS packages. -g = global CLI tools.",
+            [
+                ("npm install -g <pkg>", "global CLI tool"),
+                ("npm install <pkg>", "into current project"),
+                ("npm uninstall -g <pkg>", "remove global"),
+                ("npm list -g --depth=0", "global packages"),
+                ("npx <cmd>", "run package without global install"),
+            ],
+        )
+
+    if which("cargo"):
+        add(
+            "cargo",
+            "cargo — Rust packages / binaries",
+            which("cargo"),
+            "Installs Rust CLI tools to ~/.cargo/bin (keep that on PATH).",
+            [
+                ("cargo install <crate>", "install binary crate"),
+                ("cargo uninstall <crate>", "remove"),
+                ("cargo search <name>", "search crates.io"),
+                ("cargo install --list", "installed binaries"),
+            ],
+        )
+
+    if which("gem"):
+        add(
+            "gem",
+            "gem — Ruby packages",
+            which("gem"),
+            "RubyGems. On Termux often needs pkg install ruby.",
+            [
+                ("gem install <name>", "install gem"),
+                ("gem uninstall <name>", "remove"),
+                ("gem list", "installed gems"),
+                ("gem search <name>", "search"),
+            ],
+        )
+
+    if which("go"):
+        add(
+            "go",
+            "go install — Go tools",
+            which("go"),
+            "Installs to ~/go/bin or GOPATH/bin.",
+            [
+                ("go install <module>@latest", "install tool"),
+                ("go version", "toolchain version"),
+            ],
+        )
+
+    return entries
+
+
+def show_packages():
+    section("Package managers on this machine")
+    entries = pm_catalog()
+    present = [e for e in entries if e["present"]]
+    missing_os = [e for e in entries if not e["present"] and e["id"] in (
+        "pkg", "apt", "brew", "dnf", "pacman", "apk", "zypper", "xbps", "nix"
+    )]
+
+    if not present:
+        lines.append("  \033[33mNo known package managers detected on PATH.\033[0m")
+    else:
+        lines.append("  \033[90mPresent:\033[0m " + ", ".join(
+            f"\033[1;32m{e['id']}\033[0m" for e in present
+        ))
+        lines.append("")
+
+    for e in present:
+        lines.append(f"  \033[1;36m▸ {e['title']}\033[0m")
+        if e["path"]:
+            lines.append(f"      \033[90m{e['path']}\033[0m")
+        if e["notes"]:
+            lines.append(f"      {e['notes']}")
+        for c, why in e["commands"]:
+            cmd(c, why)
+        lines.append("")
+
+    # Primary recommendation
+    section("Which installer should I use?")
+    if TERMUX and which("pkg"):
+        lines.append("  \033[1mPrimary:\033[0m  pkg   (Termux packages — start here)")
+        lines.append("  \033[1mAlso:\033[0m     pip / npm / cargo for language tools")
+        lines.append("  \033[90mAvoid raw apt on Termux unless you know why.\033[0m")
+    elif which("brew"):
+        lines.append("  \033[1mPrimary:\033[0m  brew")
+    elif which("apt") and not TERMUX:
+        lines.append("  \033[1mPrimary:\033[0m  apt  (with sudo)")
+    elif which("dnf"):
+        lines.append("  \033[1mPrimary:\033[0m  dnf")
+    elif which("pacman"):
+        lines.append("  \033[1mPrimary:\033[0m  pacman")
+    elif which("apk"):
+        lines.append("  \033[1mPrimary:\033[0m  apk")
+    else:
+        lines.append("  \033[33mNo OS package manager found — use language tools or install one.\033[0m")
+    lines.append("")
+    lines.append("  \033[90mTip: helpme search install    ·  helpme topic pkg\033[0m")
+
+
+def show_do():
+    """Most important everyday tasks — commands adapted to this host."""
+    section("Most important things — copy-paste commands")
+
+    # Pick primary install line
+    if TERMUX and which("pkg"):
+        install = "pkg install"
+        update = "pkg update && pkg upgrade"
+        search_pkg = "pkg search"
+    elif which("brew"):
+        install = "brew install"
+        update = "brew update && brew upgrade"
+        search_pkg = "brew search"
+    elif which("apt") and not TERMUX:
+        install = "sudo apt install"
+        update = "sudo apt update && sudo apt upgrade"
+        search_pkg = "apt search"
+    elif which("dnf"):
+        install = "sudo dnf install"
+        update = "sudo dnf upgrade"
+        search_pkg = "dnf search"
+    elif which("pacman"):
+        install = "sudo pacman -S"
+        update = "sudo pacman -Syu"
+        search_pkg = "pacman -Ss"
+    elif which("apk"):
+        install = "sudo apk add"
+        update = "sudo apk update && sudo apk upgrade"
+        search_pkg = "apk search"
+    else:
+        install = "# (no OS package manager detected) install"
+        update = "# update packages"
+        search_pkg = "# search packages"
+
+    lines.append(f"  \033[1;35m1. Keep the system updated\033[0m")
+    cmd(update, "download new package lists and upgrade installed software")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m2. Install software\033[0m")
+    cmd(f"{search_pkg} <keyword>", "find the package name first")
+    cmd(f"{install} <name>", "install it")
+    if TERMUX:
+        cmd(f"{install} git curl wget openssh man fzf", "sensible starter kit on Termux")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m3. See who you are / where you are\033[0m")
+    cmd("whoami", "your username")
+    cmd("pwd", "current directory")
+    cmd("hostname", "machine name")
+    cmd("uname -a", "kernel / arch one-liner")
+    cmd("helpme system machine", "richer machine profile (this tool)")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m4. Files and directories\033[0m")
+    cmd("ls -la", "list files including hidden (dotfiles)")
+    cmd("cd <dir>   ·  cd ..   ·  cd ~", "move around (cd is a shell builtin)")
+    cmd("mkdir -p path/to/dir", "create directory tree")
+    cmd("cp -r src dest", "copy file or folder")
+    cmd("mv old new", "rename or move")
+    cmd("rm file    ·  rm -ri dir", "delete (careful; -i asks)")
+    cmd("find . -name '*.md'", "find files by name")
+    cmd("du -sh *  2>/dev/null | sort -h", "what uses disk space here")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m5. Read and edit text\033[0m")
+    editor = os.environ.get("EDITOR") or (
+        "nvim" if which("nvim") else "vim" if which("vim") else "nano" if which("nano") else "vi"
+    )
+    cmd(f"{editor} file", f"edit with your editor (EDITOR or detected: {editor})")
+    cmd("less file   ·  head -n 20 file   ·  tail -f file", "read / follow logs")
+    cmd("grep -Rni 'text' .", "search inside files")
+    cmd("cat file", "print whole file")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m6. Network\033[0m")
+    cmd("ping -c 3 1.1.1.1", "can I reach the internet?")
+    if which("curl"):
+        cmd("curl -I https://example.com", "HTTP headers / connectivity")
+        cmd("curl -fsSL <url> -o file", "download a file")
+    if which("wget"):
+        cmd("wget <url>", "download")
+    if which("ssh"):
+        cmd("ssh user@host", "remote shell")
+        cmd("scp file user@host:path", "copy file over ssh")
+    if which("ip"):
+        cmd("ip addr", "network interfaces / IPs")
+    elif which("ifconfig"):
+        cmd("ifconfig", "network interfaces")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m7. Processes — what's running / stop it\033[0m")
+    cmd("ps aux | head", "list processes")
+    if which("htop"):
+        cmd("htop", "interactive process viewer")
+    elif which("top"):
+        cmd("top", "process viewer (q to quit)")
+    cmd("kill <pid>    ·  kill -9 <pid>", "stop a process (9 = force)")
+    cmd("pkill -f name", "kill by command name")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m8. Permissions and ownership\033[0m")
+    cmd("chmod +x script.sh", "make executable")
+    cmd("chmod 600 secret", "only you can read/write")
+    if not TERMUX:
+        cmd("sudo <command>", "run as root (careful)")
+        cmd("chown user:group file", "change owner")
+    else:
+        cmd("# no root on Termux by default", "Android sandbox — use \$PREFIX paths")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m9. Archives and compression\033[0m")
+    cmd("tar -czvf out.tar.gz dir/", "create .tar.gz")
+    cmd("tar -xzvf out.tar.gz", "extract .tar.gz")
+    if which("unzip"):
+        cmd("unzip file.zip    ·  zip -r out.zip dir/", "zip files")
+    lines.append("")
+
+    lines.append(f"  \033[1;35m10. Discover commands (helpme)\033[0m")
+    cmd("helpme", "fuzzy-browse every indexed command")
+    cmd("helpme search compress", "find tools by what they do")
+    cmd("helpme <cmd>", "docs for one command")
+    cmd("helpme topics", "hidden knowledge that is not a binary")
+    cmd("helpme doctor", "what's broken or missing on this machine")
+    lines.append("")
+
+    if TERMUX:
+        lines.append(f"  \033[1;35m11. Termux-specific essentials\033[0m")
+        cmd("termux-setup-storage", "access Photos/Downloads (Android permission)")
+        cmd("termux-change-repo", "fix slow/broken package mirrors")
+        cmd("termux-info", "dump Termux/Android environment")
+        cmd("echo \$PREFIX", "Termux 'root' like /usr — packages live here")
+        cmd("pkg install termux-api", "phone APIs (needs Termux:API app)")
+        storage = Path.home() / "storage"
+        if storage.is_dir():
+            cmd("ls ~/storage", "shared storage is linked ✓")
+        else:
+            lines.append("  \033[33m~/storage missing — run termux-setup-storage\033[0m")
+        lines.append("")
+
+
+def show_files_extra():
+    section("Files — quick map of important places")
+    home = Path.home()
+    places = [
+        (str(home), "your home directory"),
+        (str(home / ".local" / "bin"), "user-installed CLIs (keep on PATH)"),
+        (str(home / ".config"), "app config files"),
+        (str(home / ".ssh"), "SSH keys (private — never share)"),
+    ]
+    if TERMUX:
+        prefix = os.environ.get("PREFIX", "")
+        places.extend([
+            (prefix, "Termux PREFIX (packages, bin, etc)"),
+            (f"{prefix}/bin", "most Termux commands live here"),
+            (f"{prefix}/etc", "system config inside Termux"),
+            (str(home / "storage"), "Android shared storage (after setup)"),
+            (str(home / "storage" / "downloads"), "Downloads folder"),
+            (str(home / "storage" / "shared"), "often /sdcard"),
+        ])
+    else:
+        places.extend([
+            ("/usr/bin", "system commands"),
+            ("/etc", "system configuration"),
+            ("/var/log", "logs"),
+            ("/tmp", "temporary files"),
+        ])
+    for path, why in places:
+        exists = os.path.exists(path)
+        mark = "\033[32m✓\033[0m" if exists else "\033[31m✗\033[0m"
+        row(mark + " " + path, why, width=42)
+
+
+def show_network_extra():
+    section("Network — status")
+    if which("ping"):
+        out = run(["ping", "-c", "1", "-W", "2", "1.1.1.1"], timeout=4)
+        ok = "1 received" in out or "1 packets received" in out or "bytes from" in out
+        row("Internet", "\033[32mreachable\033[0m" if ok else "\033[33mno reply to 1.1.1.1\033[0m")
+    if which("ip"):
+        out = run(["ip", "-br", "addr"], timeout=2)
+        if out:
+            lines.append("  \033[90minterfaces:\033[0m")
+            for ln in out.splitlines()[:8]:
+                lines.append(f"    {ln}")
+    dns = ""
+    for resolv in ("/etc/resolv.conf", f"{os.environ.get('PREFIX','')}/etc/resolv.conf"):
+        if resolv and os.path.isfile(resolv):
+            try:
+                with open(resolv) as f:
+                    dns = ", ".join(
+                        ln.split()[1] for ln in f if ln.startswith("nameserver")
+                    )
+            except OSError:
+                pass
+            break
+    if dns:
+        row("DNS", dns)
+
+
+def show_termux_extra():
+    if not TERMUX:
+        lines.append("  \033[90mNot a Termux environment.\033[0m")
+        return
+    section("Termux cheat sheet")
+    cmd("pkg update && pkg upgrade", "update everything")
+    cmd("pkg install git python nodejs openssh", "common developer stack")
+    cmd("termux-setup-storage", "link ~/storage to Android files")
+    cmd("sshd", "start SSH server (pkg install openssh first)")
+    cmd("passwd", "set password before SSH login")
+    cmd("termux-wake-lock", "keep CPU awake for long jobs")
+    cmd("termux-wake-unlock", "allow sleep again")
+    lines.append("")
+    lines.append("  \033[90mPaths:\033[0m")
+    row("\$PREFIX", os.environ.get("PREFIX", ""))
+    row("\$HOME", os.path.expanduser("~"))
+    row("shared storage", str(Path.home() / "storage"))
+
+
+# --- Header --- #
+lines.append(f"\033[1;32mhelpme system\033[0m  \033[90m— this machine, its package managers, and what to run\033[0m")
+if query != "all":
+    lines.append(f"\033[90msection: {query}\033[0m")
+
+aliases = {
+    "machine": "machine", "host": "machine", "hw": "machine", "os": "machine",
+    "packages": "packages", "pkg": "packages", "pkgs": "packages", "pm": "packages",
+    "install": "packages",
+    "do": "do", "essentials": "do", "commands": "do", "howto": "do", "tasks": "do",
+    "files": "files", "dirs": "files", "paths": "files",
+    "network": "network", "net": "network",
+    "termux": "termux", "android": "termux",
+}
+
+section_id = aliases.get(query, query)
+
+if want_all or section_id == "machine":
+    show_machine()
+if want_all or section_id == "packages":
+    show_packages()
+if want_all or section_id == "do":
+    show_do()
+if want_all or section_id == "files":
+    show_files_extra()
+if want_all or section_id == "network":
+    show_network_extra()
+if want_all or section_id == "termux":
+    show_termux_extra()
+
+if section_id not in ("all", "machine", "packages", "do", "files", "network", "termux") and not want_all:
+    lines.append(f"[helpme system] unknown section {query!r}")
+    lines.append("  Use: machine | packages | do | files | network | termux | all")
+
+lines.append("")
+lines.append(SEP)
+lines.append("\033[90mSections:  helpme system machine | packages | do | files | network | termux\033[0m")
+lines.append("\033[90mAlso:     helpme map · helpme doctor · helpme topics · helpme search <idea>\033[0m")
+
+__oval_result__ = "\n".join(lines)
+)_python

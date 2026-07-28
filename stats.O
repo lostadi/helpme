@@ -1,0 +1,126 @@
+#!/usr/bin/env O
+# helpme stats — coverage report for the local command index.
+# Uses Ostadix sql + python: query in SQL, present in Python.
+
+O^(
+let report = python^(
+import os, sqlite3, json
+
+DB = os.environ.get("HELPME_DB", os.path.expanduser("~/.local/share/helpme/db/index.db"))
+out = {"ok": False}
+
+if not os.path.exists(DB):
+    out["error"] = "Index not found. Run: helpme reindex"
+else:
+    con = sqlite3.connect(DB)
+    try:
+        con.execute("ALTER TABLE commands ADD COLUMN kind TEXT DEFAULT 'binary'")
+        con.commit()
+    except Exception:
+        pass
+    def q(sql, args=()):
+        return con.execute(sql, args).fetchall()
+
+    total = q("SELECT COUNT(*) FROM commands")[0][0]
+    by_kind = q(
+        "SELECT COALESCE(kind,'binary') AS k, COUNT(*) FROM commands GROUP BY k ORDER BY 2 DESC"
+    )
+    with_man = q("SELECT COUNT(*) FROM commands WHERE IFNULL(man_text,'')!=''")[0][0]
+    with_help = q("SELECT COUNT(*) FROM commands WHERE IFNULL(help_short,'')!=''")[0][0]
+    with_tldr = q("SELECT COUNT(*) FROM commands WHERE IFNULL(tldr_text,'')!=''")[0][0]
+    with_info = q("SELECT COUNT(*) FROM commands WHERE IFNULL(info_text,'')!=''")[0][0]
+    with_ai = q("SELECT COUNT(*) FROM commands WHERE IFNULL(ai_summary,'')!=''")[0][0]
+    with_syn = q("SELECT COUNT(*) FROM commands WHERE IFNULL(synopsis,'')!=''")[0][0]
+    undoc = q(
+        """
+        SELECT COUNT(*) FROM commands
+        WHERE IFNULL(man_text,'')='' AND IFNULL(help_short,'')=''
+          AND IFNULL(tldr_text,'')='' AND IFNULL(info_text,'')=''
+        """
+    )[0][0]
+    recent = q(
+        "SELECT name, COALESCE(kind,'binary'), substr(indexed_at,1,10) "
+        "FROM commands ORDER BY indexed_at DESC LIMIT 8"
+    )
+    # densest short descriptions (good for demos)
+    sample = q(
+        """
+        SELECT name, COALESCE(kind,'binary'), synopsis FROM commands
+        WHERE IFNULL(synopsis,'')!=''
+        ORDER BY length(synopsis) DESC LIMIT 5
+        """
+    )
+    fts = q("SELECT name FROM sqlite_master WHERE type='table' AND name='commands_fts'")
+    con.close()
+    out = {
+        "ok": True,
+        "total": total,
+        "by_kind": [{"kind": k, "n": n} for k, n in by_kind],
+        "with_man": with_man,
+        "with_help": with_help,
+        "with_tldr": with_tldr,
+        "with_info": with_info,
+        "with_ai": with_ai,
+        "with_synopsis": with_syn,
+        "undoc": undoc,
+        "fts": bool(fts),
+        "recent": [{"name": n, "kind": k, "at": a} for n, k, a in recent],
+        "long_synopses": [{"name": n, "kind": k, "synopsis": s} for n, k, s in sample],
+        "db": DB,
+    }
+
+__oval_result__ = json.dumps(out)
+)_python
+
+python^(
+import json, os, textwrap
+
+raw = $report
+# $report may arrive as O text; coerce
+if not isinstance(raw, str):
+    raw = str(raw)
+data = json.loads(raw)
+SEP = "─" * 72
+lines = []
+
+if not data.get("ok"):
+    lines.append(f"[helpme stats] {data.get('error', 'unknown error')}")
+else:
+    total = max(data["total"], 1)
+    def pct(n):
+        return f"{n:>5}  ({100*n//total:3d}%)"
+
+    lines.append(f"\033[1;32mhelpme stats\033[0m  \033[90m{data['db']}\033[0m")
+    lines.append(SEP)
+    lines.append(f"  \033[1mTotal indexed\033[0m     {data['total']}")
+    lines.append(f"  FTS5 search       {'yes' if data['fts'] else 'no — run helpme reindex'}")
+    lines.append("")
+    lines.append(f"\033[1;33mBy kind\033[0m")
+    for item in data["by_kind"]:
+        lines.append(f"  {item['kind']:<12} {item['n']}")
+    lines.append("")
+    lines.append(f"\033[1;33mDocumentation coverage\033[0m")
+    lines.append(f"  synopsis       {pct(data['with_synopsis'])}")
+    lines.append(f"  man page       {pct(data['with_man'])}")
+    lines.append(f"  --help/help    {pct(data['with_help'])}")
+    lines.append(f"  tldr           {pct(data['with_tldr'])}")
+    lines.append(f"  info           {pct(data['with_info'])}")
+    lines.append(f"  AI summary     {pct(data['with_ai'])}")
+    lines.append(f"  \033[33mno docs at all\033[0m {pct(data['undoc'])}")
+    lines.append("")
+    lines.append(f"\033[1;33mRecently indexed\033[0m")
+    for r in data["recent"]:
+        lines.append(f"  {r['at']}  {r['name']:<20} \033[90m{r['kind']}\033[0m")
+    if data["long_synopses"]:
+        lines.append("")
+        lines.append(f"\033[1;33mSample synopses\033[0m")
+        for r in data["long_synopses"]:
+            syn = (r["synopsis"] or "")[:60]
+            lines.append(f"  \033[1;32m{r['name']}\033[0m — {syn}")
+    lines.append("")
+    lines.append(f"\033[90mhelpme undoc   — list commands with nothing harvested\033[0m")
+    lines.append(f"\033[90mhelpme search  — find by description, not name\033[0m")
+
+__oval_result__ = "\n".join(lines)
+)_python
+)_O

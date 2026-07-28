@@ -1,0 +1,190 @@
+#!/usr/bin/env O
+# helpme ai — generate an AI summary for a command via Ollama REST API.
+#             Bypasses aichat to surface real Ollama errors immediately.
+#
+# Env vars:
+#   HELPME_DB       — path to index.db
+#   HELPME_QUERY    — command name
+#   HELPME_AI_MODEL — Ollama model name (auto-detected if unset)
+#   OLLAMA_HOST     — Ollama base URL (default: http://localhost:11434)
+
+python^(
+import os, sqlite3, sys, socket, json
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
+LLAMACPP_HOST = os.environ.get("LLAMACPP_HOST", "http://localhost:8080").rstrip("/")
+
+
+DB        = os.environ.get("HELPME_DB",       os.path.expanduser("~/.local/share/helpme/db/index.db"))
+name      = os.environ.get("HELPME_QUERY",    "").strip()
+OLLAMA    = os.environ.get("OLLAMA_HOST",     "http://localhost:11434").rstrip("/")
+output    = ""
+
+EMBED_MARKERS = ("embed", "nomic", "bge", "clip", "minilm", "rerank")
+
+def check_llamacpp(timeout=2):
+    try:
+        with urlopen(f"{LLAMACPP_HOST}/v1/models", timeout=timeout) as r:
+            if r.status == 200:
+                data = json.loads(r.read())
+                models = data.get("data", [])
+                if models:
+                    return models[0]["id"]
+            return "default"
+    except Exception:
+        return None
+
+def stream_llamacpp(model, prompt, timeout=120):
+    messages = [
+        {"role": "system", "content": "You are a helpful CLI documentation assistant. Explain the command clearly and concisely."},
+        {"role": "user", "content": prompt}
+    ]
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": 400
+    }).encode()
+    req = Request(f"{LLAMACPP_HOST}/v1/chat/completions", data=body,
+                  headers={"Content-Type": "application/json"})
+    full = []
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode().strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            sys.stderr.write(token)
+                            sys.stderr.flush()
+                            full.append(token)
+                except json.JSONDecodeError:
+                    pass
+        sys.stderr.write("\n")
+        return "".join(full).strip(), None
+    except HTTPError as e:
+        return None, f"HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return None, str(e)
+
+def ollama_get(path, timeout=4):
+    try:
+        with urlopen(f"{OLLAMA}{path}", timeout=timeout) as r:
+            return json.loads(r.read()), None
+    except URLError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, str(e)
+
+def pick_model(override):
+    if override:
+        return override, None
+    data, err = ollama_get("/api/tags")
+    if err:
+        return None, f"Cannot reach Ollama at {OLLAMA}: {err}"
+    models = [
+        m for m in data.get("models", [])
+        if not any(k in m["name"].lower() for k in EMBED_MARKERS)
+    ]
+    if not models:
+        return None, "No chat models found in Ollama. Pull one first: ollama pull <model>"
+    models.sort(key=lambda m: m.get("size", 9e18))
+    return models[0]["name"], None
+
+def stream_generate(model, prompt, timeout=120):
+    """Call /api/generate with stream=true, print tokens to stderr, return full text."""
+    body = json.dumps({"model": model, "prompt": prompt, "stream": True}).encode()
+    req  = Request(f"{OLLAMA}/api/generate", data=body,
+                   headers={"Content-Type": "application/json"})
+    full = []
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                chunk = json.loads(raw_line.decode())
+                if "error" in chunk:
+                    return None, chunk["error"]
+                token = chunk.get("response", "")
+                sys.stderr.write(token)
+                sys.stderr.flush()
+                full.append(token)
+                if chunk.get("done"):
+                    break
+        sys.stderr.write("\n")
+        return "".join(full).strip(), None
+    except HTTPError as e:
+        try:
+            body = json.loads(e.read()).get("error", e.reason)
+        except Exception:
+            body = e.reason
+        return None, f"HTTP {e.code}: {body}"
+    except URLError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, str(e)
+
+# --- main --- #
+
+if not name:
+    output = "[helpme ai] No command specified. Usage: helpme ai <command>"
+elif not os.path.exists(DB):
+    output = "[helpme ai] Index not found. Run: helpme reindex"
+else:
+    con = sqlite3.connect(DB)
+    row = con.execute(
+        "SELECT name,man_text,help_short,ai_summary FROM commands WHERE name=?", (name,)
+    ).fetchone()
+
+    if not row:
+        output = f"[helpme ai] '{name}' not in index. Run: helpme reindex"
+        con.close()
+    else:
+        cmd_name, man_text, help_short, ai_summary = row
+
+        if ai_summary:
+            output = f"[cached]\n\n{ai_summary}"
+            con.close()
+        else:
+            doc = (man_text or help_short or "").strip()[:3000]
+            prompt = (
+                f"In 3-5 sentences, explain what the command `{cmd_name}` does "
+                f"and its most common use cases."
+                + (f" Here is its documentation:\n\n{doc}" if doc else "")
+            )
+
+            llama_model = check_llamacpp()
+            if llama_model:
+                print(f"[helpme ai] using llama.cpp (model: {llama_model})", file=sys.stderr)
+                summary, err = stream_llamacpp(llama_model, prompt)
+                prefix = "llama.cpp error"
+            else:
+                model, err = pick_model(os.environ.get("HELPME_AI_MODEL", "").strip())
+                if err:
+                    output = f"[helpme ai] No AI provider available. {err}"
+                    con.close()
+                    __oval_result__ = output
+                    sys.exit(0)
+                else:
+                    print(f"[helpme ai] using Ollama (model: {model})", file=sys.stderr)
+                    summary, err = stream_generate(model, prompt)
+                    prefix = "Ollama error"
+
+            if err:
+                output = f"[helpme ai] {prefix}: {err}"
+            else:
+                con.execute("UPDATE commands SET ai_summary=? WHERE name=?", (summary, cmd_name))
+                con.commit()
+                output = summary
+            con.close()
+
+__oval_result__ = output
+)_python

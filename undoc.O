@@ -1,0 +1,68 @@
+#!/usr/bin/env O
+# helpme undoc — list commands that have no harvested documentation.
+# These are the "black boxes" still invisible after indexing.
+
+python^(
+import os, sqlite3
+
+DB    = os.environ.get("HELPME_DB", os.path.expanduser("~/.local/share/helpme/db/index.db"))
+limit = int(os.environ.get("HELPME_LIMIT", "80"))
+SEP   = "─" * 72
+output = ""
+
+if not os.path.exists(DB):
+    output = "[helpme] Index not found. Run: helpme reindex"
+else:
+    con = sqlite3.connect(DB)
+    try:
+        con.execute("ALTER TABLE commands ADD COLUMN kind TEXT DEFAULT 'binary'")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    rows = con.execute(
+        """
+        SELECT name, path, COALESCE(kind,'binary')
+        FROM commands
+        WHERE IFNULL(man_text,'')='' AND IFNULL(help_short,'')=''
+          AND IFNULL(tldr_text,'')='' AND IFNULL(info_text,'')=''
+          AND IFNULL(synopsis,'')=''
+        ORDER BY kind, name
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    total_undoc = con.execute(
+        """
+        SELECT COUNT(*) FROM commands
+        WHERE IFNULL(man_text,'')='' AND IFNULL(help_short,'')=''
+          AND IFNULL(tldr_text,'')='' AND IFNULL(info_text,'')=''
+          AND IFNULL(synopsis,'')=''
+        """
+    ).fetchone()[0]
+    total = con.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+    con.close()
+
+    lines = [
+        f"\033[1;32mhelpme undoc\033[0m  \033[90m{total_undoc}/{total} commands with no docs harvested\033[0m",
+        SEP,
+        "These names exist on your machine but helpme found no man/--help/tldr/info.",
+        "They are the remaining 'hidden knowledge' after a reindex.",
+        "",
+    ]
+    if not rows:
+        lines.append("  \033[32mNone — every indexed command has some text.\033[0m")
+    else:
+        for name, path, kind in rows:
+            lines.append(
+                f"  \033[1m{name:<22}\033[0m \033[35m{kind:<8}\033[0m \033[90m{path}\033[0m"
+            )
+        if total_undoc > len(rows):
+            lines.append(f"\n  \033[90m… and {total_undoc - len(rows)} more "
+                         f"(HELPME_LIMIT={limit})\033[0m")
+    lines.append("")
+    lines.append("\033[90mTry: helpme ai <name>  — generate a plain-language summary\033[0m")
+    lines.append("\033[90m     helpme reindex --force  — re-harvest after installing man/tldr\033[0m")
+    output = "\n".join(lines)
+
+__oval_result__ = output
+)_python

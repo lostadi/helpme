@@ -1,0 +1,295 @@
+#!/usr/bin/env O
+# helpme reindex — scan every binary on PATH + shell builtins, harvest
+# man/whatis/--help/tldr/info, store in SQLite (+ FTS) at HELPME_DB.
+#
+# Env vars (set by the helpme wrapper):
+#   HELPME_DB    — path to index.db
+#   HELPME_FORCE — "1" to re-index already-seen entries
+#   HELPME_WORKERS — parallel harvest workers (default 16)
+#
+# Note: all logic lives in Python blocks because O-lang parses $IDENT inside
+# bash blocks as binding references, making bash vars conflict. Python's exec()
+# is opaque to the O-lang parser.
+
+python^(
+import os, sqlite3, subprocess, sys, stat, datetime, re, shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+DB      = os.environ.get("HELPME_DB", os.path.expanduser("~/.local/share/helpme/db/index.db"))
+FORCE   = os.environ.get("HELPME_FORCE", "0") == "1"
+WORKERS = int(os.environ.get("HELPME_WORKERS", "16"))
+
+# --- schema init --- #
+os.makedirs(os.path.dirname(DB), exist_ok=True)
+con = sqlite3.connect(DB, check_same_thread=False)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS commands (
+        name        TEXT PRIMARY KEY,
+        path        TEXT,
+        synopsis    TEXT,
+        man_text    TEXT,
+        help_short  TEXT,
+        ai_summary  TEXT,
+        indexed_at  TEXT,
+        tldr_text   TEXT,
+        info_text   TEXT,
+        kind        TEXT DEFAULT 'binary'
+    )
+""")
+for col, decl in (
+    ("tldr_text", "TEXT"),
+    ("info_text", "TEXT"),
+    ("kind", "TEXT DEFAULT 'binary'"),
+):
+    try:
+        con.execute(f"ALTER TABLE commands ADD COLUMN {col} {decl}")
+    except sqlite3.OperationalError:
+        pass
+
+# Full-text search over the docs people cannot see without knowing names
+con.execute("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS commands_fts USING fts5(
+        name, synopsis, man_text, help_short, tldr_text, ai_summary,
+        content='commands', content_rowid='rowid',
+        tokenize='porter unicode61'
+    )
+""")
+con.commit()
+print(f"[helpme] DB: {DB}", file=sys.stderr)
+
+# --- helpers --- #
+def run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip()
+    except Exception:
+        return ""
+
+def strip_overstrike(text):
+    """Remove man-page overstrike bold/italic: X\\bX -> X, _\\bX -> X."""
+    return re.sub(r'.\x08', '', text)
+
+def synopsis_from_man(man_text):
+    in_name = False
+    for line in man_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if in_name:
+                break
+            continue
+        if stripped in ("NAME", "Name"):
+            in_name = True
+            continue
+        if in_name:
+            m = re.search(r'[-\u2013\u2014]\s*(.+)', stripped)
+            if m:
+                return m.group(1).strip()[:200]
+    return ""
+
+def get_man(name):
+    raw = run(["man", "-P", "cat", name], timeout=6)
+    if not raw:
+        return ""
+    cleaned = strip_overstrike(raw)
+    first = cleaned.splitlines()[0].strip() if cleaned.splitlines() else ""
+    if first.lower().startswith("no manual entry") or first.lower().startswith("no entry for"):
+        return ""
+    return cleaned[:8000]
+
+def get_tldr(name):
+    if not shutil.which("tldr"):
+        return ""
+    raw = run(["tldr", "--raw", name], timeout=4)
+    if not raw or "command not found" in raw.lower() or "page not found" in raw.lower():
+        return ""
+    return raw[:4000]
+
+def get_info(name):
+    if not shutil.which("info"):
+        return ""
+    raw = run(["info", "--subnodes", "--output=-", name], timeout=6)
+    if not raw or "command not found" in raw.lower() or "no menu item" in raw.lower() or "Cannot find node" in raw:
+        return ""
+    return raw[:8000]
+
+# --- Phase 1a: PATH binaries --- #
+path_dirs = os.environ.get("PATH", "").split(":")
+seen = {}
+entries = []  # (name, path, kind)
+for d in path_dirs:
+    if not os.path.isdir(d):
+        continue
+    try:
+        for name in sorted(os.listdir(d)):
+            if name in seen:
+                continue
+            full = os.path.join(d, name)
+            try:
+                s = os.stat(full)
+                if stat.S_ISREG(s.st_mode) and os.access(full, os.X_OK):
+                    seen[name] = full
+                    entries.append((name, full, "binary"))
+            except OSError:
+                pass
+    except PermissionError:
+        pass
+
+# --- Phase 1b: shell builtins (hidden knowledge — not on PATH) --- #
+def discover_builtins():
+    """Return list of (name, 'shell-builtin', 'builtin') for the active shell."""
+    shell = os.environ.get("SHELL", "") or "/bin/sh"
+    base = os.path.basename(shell)
+    names = []
+    if base in ("bash", "sh") or "bash" in shell:
+        out = run([shell, "-c", "compgen -b"], timeout=3)
+        names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    elif base == "zsh" or "zsh" in shell:
+        out = run([shell, "-c", "print -l \${(k)builtins}"], timeout=3)
+        names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    elif base == "fish":
+        out = run([shell, "-c", "builtin -n"], timeout=3)
+        names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    else:
+        # Portable fallback: common POSIX builtins
+        names = [
+            "alias", "bg", "cd", "command", "echo", "eval", "exec", "exit",
+            "export", "fg", "getopts", "hash", "pwd", "read", "readonly",
+            "return", "set", "shift", "test", "times", "trap", "type", "ulimit",
+            "umask", "unalias", "unset", "wait", ":", ".", "[", "break",
+            "continue", "false", "true", "kill", "printf", "umask",
+        ]
+    result = []
+    for n in names:
+        if not n or n in seen:
+            continue
+        seen[n] = f"builtin:{base or 'sh'}"
+        result.append((n, f"builtin:{base or 'sh'}", "builtin"))
+    return result
+
+builtin_entries = discover_builtins()
+entries.extend(builtin_entries)
+print(
+    f"[helpme] Shell builtins discovered: {len(builtin_entries)} "
+    f"(shell={os.path.basename(os.environ.get('SHELL', 'sh'))})",
+    file=sys.stderr,
+)
+
+total = len(entries)
+already = {row[0] for row in con.execute("SELECT name FROM commands")}
+to_index = [(n, p, k) for n, p, k in entries if n not in already or FORCE]
+print(
+    f"[helpme] Found {total} entries ({len(to_index)} to index, "
+    f"{total - len(to_index)} already present).",
+    file=sys.stderr,
+)
+
+# --- Phase 2: parallel doc harvesting --- #
+def harvest(name, path, kind):
+    synopsis = ""
+    out = run(["whatis", name])
+    for line in out.splitlines():
+        if line.strip() and not line.startswith("whatis:") and not line.startswith("man:"):
+            m = re.search(r'[-\u2013\u2014]\s*(.+)', line)
+            synopsis = (m.group(1).strip()[:200] if m else line.strip()[:200])
+            break
+
+    man_text = get_man(name)
+    if not synopsis and man_text:
+        synopsis = synopsis_from_man(man_text)
+
+    help_short = ""
+    if kind == "builtin":
+        # help is a shell builtin — ask the shell (not a file on PATH)
+        shell = os.environ.get("SHELL", "/bin/sh")
+        base = os.path.basename(shell)
+        h = ""
+        if base == "zsh" or "zsh" in shell:
+            # Prefer zsh's run-help / man extraction; fall back to whence
+            h = run(
+                [shell, "-fc",
+                 f"unalias run-help 2>/dev/null; autoload -Uz run-help; "
+                 f"run-help {name} 2>/dev/null | head -60"],
+                timeout=5,
+            )
+            if not h or len(h) < 20:
+                h = run([shell, "-c", f"whence -v -- {name}; type -a -- {name}"], timeout=3)
+        elif base in ("bash", "sh") or "bash" in shell:
+            h = run([shell, "-c", f"help {name} 2>/dev/null || type {name}"], timeout=4)
+        else:
+            h = run([shell, "-c", f"type {name} 2>/dev/null; help {name} 2>/dev/null"], timeout=4)
+        help_short = "\n".join(h.splitlines()[:60])
+        if not synopsis:
+            first = next((ln.strip() for ln in help_short.splitlines() if ln.strip()), "")
+            if first and "shell builtin" not in first.lower():
+                synopsis = first[:200]
+            else:
+                synopsis = f"shell builtin ({base or 'sh'})"
+    elif not man_text:
+        h = run([path, "--help"], timeout=4) or run([path, "-h"], timeout=4)
+        help_short = "\n".join(h.splitlines()[:40])
+
+    tldr_text = get_tldr(name)
+    info_text = get_info(name)
+    return (name, path, synopsis, man_text, help_short, tldr_text, info_text, kind)
+
+import threading
+lock = threading.Lock()
+done = 0
+
+def index_one(args):
+    global done
+    name, path, kind = args
+    result = harvest(name, path, kind)
+    with lock:
+        done += 1
+        if done % 50 == 0 or done == len(to_index):
+            print(f"  [{done}/{len(to_index)}] {name} ({kind})", file=sys.stderr)
+    return result
+
+results = []
+with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    futures = {pool.submit(index_one, arg): arg for arg in to_index}
+    for fut in as_completed(futures):
+        try:
+            results.append(fut.result())
+        except Exception as e:
+            n, _, _ = futures[fut]
+            print(f"  [skip] {n}: {e}", file=sys.stderr)
+
+# --- Phase 3: bulk insert --- #
+ts = datetime.datetime.utcnow().isoformat()
+# Preserve existing ai_summary on force reindex
+existing_ai = {
+    row[0]: row[1]
+    for row in con.execute("SELECT name, ai_summary FROM commands WHERE ai_summary IS NOT NULL")
+}
+rows = []
+for n, p, s, m, h, tl, i, k in results:
+    rows.append((n, p, s, m, h, existing_ai.get(n), ts, tl, i, k))
+
+con.executemany(
+    "INSERT OR REPLACE INTO commands "
+    "(name,path,synopsis,man_text,help_short,ai_summary,indexed_at,tldr_text,info_text,kind) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    rows,
+)
+con.commit()
+
+# Rebuild FTS from content table (simple + correct after bulk replace)
+try:
+    con.execute("INSERT INTO commands_fts(commands_fts) VALUES('rebuild')")
+    con.commit()
+    print("[helpme] FTS index rebuilt.", file=sys.stderr)
+except sqlite3.Error as e:
+    print(f"[helpme] FTS rebuild skipped: {e}", file=sys.stderr)
+
+con.close()
+
+skipped = total - len(to_index)
+indexed = len(results)
+print(f"\n[helpme] Indexed {indexed} entries, skipped {skipped} already-present.", file=sys.stderr)
+print(f"[helpme]   binaries + builtins total known: {total}", file=sys.stderr)
+if skipped > 0:
+    print("[helpme] Run 'helpme reindex --force' to refresh all entries.", file=sys.stderr)
+__oval_result__ = f"indexed={indexed} skipped={skipped} total={total}"
+)_python

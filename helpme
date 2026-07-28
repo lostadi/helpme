@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# helpme — make CLI knowledge visible (Termux and every other shell)
+#
+# Goal: things that are not visible become visible, so you do not need
+# hidden / tribal knowledge to use Termux or any CLI.
+#
+# Usage:
+#   helpme                  fuzzy-search all indexed commands (fzf TUI)
+#   helpme <cmd>            direct lookup with man / --help / tldr / AI
+#   helpme search <words>   full-text search (find by what it does)
+#   helpme system           machine + package managers + essential commands
+#   helpme system packages  only package-manager cheat sheets
+#   helpme system do        only "how do I …" essential commands
+#   helpme setup            install + upgrade all optional deps for this OS
+#   helpme setup --dry-run  show plan only (no package changes)
+#   helpme map              show PATH, Termux, doc tools, index coverage
+#   helpme doctor           check missing deps / broken setup
+#   helpme stats            index coverage report
+#   helpme undoc            commands still without any docs
+#   helpme topics           curated hidden-knowledge catalog
+#   helpme topic <id>       one topic (e.g. storage, path, pkg)
+#   helpme reindex          re-scan $PATH + shell builtins
+#   helpme reindex --force  re-index already-seen entries too
+#   helpme ai <cmd>         generate / refresh AI summary (local LLM)
+#   helpme --version        print version
+#   helpme --help           this text
+#
+# Env:
+#   HELPME_DIR     where .O programs and the SQLite DB live
+#   HELPME_DB      path to index.db (default: $HELPME_DIR/db/index.db)
+#   OLANG          path to the Ostadix-lang runtime binary
+#   HELPME_WORKERS parallel reindex workers (default 16)
+#   HELPME_LIMIT   max rows for search/undoc
+#   OLLAMA_HOST / LLAMACPP_HOST / HELPME_AI_MODEL   AI backends
+
+set -euo pipefail
+
+# --- Config --- #
+HELPME_DIR="${HELPME_DIR:-${HOME}/.local/share/helpme}"
+OLANG="${OLANG:-${HOME}/Ostadix-lang/target/release/O}"
+BACKENDS="${HELPME_DIR}/backends"
+export HELPME_DB="${HELPME_DB:-${HELPME_DIR}/db/index.db}"
+export HELPME_DIR
+
+VERSION="0.4.0"
+
+# Prefer a repo-local .O when developing (next to this script)
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+prog_path() {
+    local name="$1"
+    if [[ -f "${REPO_DIR}/${name}" ]]; then
+        echo "${REPO_DIR}/${name}"
+    else
+        echo "${HELPME_DIR}/${name}"
+    fi
+}
+
+run_o() {
+    local prog="$1"
+    shift || true
+    local path
+    path="$(prog_path "$prog")"
+    if [[ ! -f "$path" ]]; then
+        echo "[helpme] Missing ${prog} (expected at ${path})" >&2
+        echo "         Re-run install.sh from the helpme repo." >&2
+        exit 1
+    fi
+    exec "$OLANG" "$path" "$BACKENDS"
+}
+
+pkg_hint() {
+    local pkg="$1"
+    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]]; then
+        echo "pkg install ${pkg}"
+    elif command -v brew &>/dev/null; then
+        echo "brew install ${pkg}"
+    elif command -v apt-get &>/dev/null; then
+        echo "sudo apt install ${pkg}"
+    else
+        echo "install ${pkg} with your package manager"
+    fi
+}
+
+# --- Guards --- #
+if [[ ! -x "$OLANG" ]]; then
+    # Fall back to PATH
+    if command -v O &>/dev/null; then
+        OLANG="$(command -v O)"
+    else
+        echo "[helpme] Ostadix-lang binary not found at: $OLANG"
+        echo "         Run install.sh to build it, or set OLANG=/path/to/O"
+        exit 1
+    fi
+fi
+
+if [[ ! -d "$BACKENDS" ]]; then
+    # Dev convenience: use vendored backends next to repo
+    if [[ -d "${REPO_DIR}/Ostadix-lang/backends" ]]; then
+        BACKENDS="${REPO_DIR}/Ostadix-lang/backends"
+    else
+        echo "[helpme] Backends dir not found at: $BACKENDS"
+        echo "         Run install.sh to set up the directory structure."
+        exit 1
+    fi
+fi
+
+# --- Dispatch --- #
+ACTION="${1:-tui}"
+
+case "$ACTION" in
+
+--version|-V)
+    echo "helpme $VERSION (Ostadix-lang runtime: $OLANG)"
+    exit 0
+    ;;
+
+-h|--help|help)
+    # Emit only the leading doc comment block (stop at first non-comment)
+    awk 'NR==1 && /^#!/ { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    exit 0
+    ;;
+
+reindex)
+    export HELPME_FORCE=0
+    if [[ "${2:-}" == "--force" ]]; then
+        export HELPME_FORCE=1
+        echo "[helpme] Force re-indexing all entries (binaries + builtins)..."
+    fi
+    run_o reindex.O
+    ;;
+
+ai)
+    if [[ -z "${2:-}" ]]; then
+        echo "Usage: helpme ai <command>"
+        exit 1
+    fi
+    export HELPME_QUERY="$2"
+    run_o ai_explain.O
+    ;;
+
+search)
+    if [[ -z "${2:-}" ]]; then
+        echo "Usage: helpme search <words describing what you need>"
+        echo "  Example: helpme search compress archive"
+        exit 1
+    fi
+    shift
+    export HELPME_QUERY="$*"
+    run_o search.O
+    ;;
+
+system|machine|start|essentials|guide)
+    # helpme system [machine|packages|do|files|network|termux]
+    # aliases: machine → section machine; start/essentials → full or do
+    case "$ACTION" in
+        machine) export HELPME_QUERY="machine" ;;
+        essentials) export HELPME_QUERY="${2:-do}" ;;
+        start|guide|system)
+            if [[ -n "${2:-}" ]]; then
+                export HELPME_QUERY="$2"
+            else
+                export HELPME_QUERY="all"
+            fi
+            ;;
+    esac
+    run_o system.O
+    ;;
+
+packages|pkgs|pm)
+    export HELPME_QUERY="packages"
+    run_o system.O
+    ;;
+
+setup|deps|optionals)
+    # helpme setup [--dry-run|dry-run|plan]
+    # Auto-install + upgrade fzf/man/tldr/bat/info/sqlite for this package manager.
+    export HELPME_SETUP_DRY=0
+    export HELPME_QUERY="all"
+    for arg in "${@:2}"; do
+        case "$arg" in
+            --dry-run|dry-run|plan|-n)
+                export HELPME_SETUP_DRY=1
+                export HELPME_QUERY="dry-run"
+                ;;
+            --yes|-y) export HELPME_SETUP_YES=1 ;;
+        esac
+    done
+    run_o setup.O
+    ;;
+
+map|env)
+    run_o map.O
+    ;;
+
+doctor|check)
+    run_o doctor.O
+    ;;
+
+stats)
+    run_o stats.O
+    ;;
+
+undoc|blind)
+    run_o undoc.O
+    ;;
+
+topics)
+    export HELPME_QUERY="${2:-}"
+    run_o topics.O
+    ;;
+
+topic)
+    if [[ -z "${2:-}" ]]; then
+        export HELPME_QUERY=""
+    else
+        export HELPME_QUERY="$2"
+    fi
+    run_o topics.O
+    ;;
+
+# ---- TUI (no args) ---- #
+tui|"")
+    if [[ ! -f "$HELPME_DB" ]]; then
+        echo "[helpme] No index found. Run: helpme reindex"
+        exit 1
+    fi
+    if ! command -v fzf &>/dev/null; then
+        echo "[helpme] fzf not found — $(pkg_hint fzf)"
+        echo "         Or use: helpme search <words>  /  helpme <cmd>  /  helpme map"
+        exit 1
+    fi
+
+    PREVIEW_CMD="HELPME_DB='${HELPME_DB}' HELPME_DIR='${HELPME_DIR}' OLANG='${OLANG}' '${0}' {1}"
+
+    # Ensure kind column exists (older indexes predate it)
+    sqlite3 "$HELPME_DB" "ALTER TABLE commands ADD COLUMN kind TEXT DEFAULT 'binary';" 2>/dev/null || true
+    QUERY="SELECT name, COALESCE(synopsis,''), COALESCE(kind,'binary') FROM commands ORDER BY name"
+    sqlite3 "$HELPME_DB" "$QUERY" 2>/dev/null \
+    | awk -F'|' '{printf "%-22s  %-8s  %s\n", $1, $3, $2}' \
+    | fzf \
+        --ansi \
+        --height=95% \
+        --layout=reverse \
+        --border=sharp \
+        --prompt="helpme> " \
+        --header="Enter: view  Ctrl-A: AI  Ctrl-S: search  Ctrl-R: reindex  Ctrl-T: topics  q: quit" \
+        --preview="${PREVIEW_CMD}" \
+        --preview-window="right:60%:wrap" \
+        --bind "enter:execute('${0}' {1} | ${BAT_CMD:-cat})" \
+        --bind "ctrl-a:execute(HELPME_DB='${HELPME_DB}' '${0}' ai {1})" \
+        --bind "ctrl-r:execute('${0}' reindex)" \
+        --bind "ctrl-t:execute('${0}' topics | ${BAT_CMD:-cat})" \
+        --bind "ctrl-s:execute(echo -n 'search> '; read -r q; '${0}' search \"\$q\" | ${BAT_CMD:-less -R})" \
+        --bind "q:abort" \
+    || true
+    ;;
+
+# ---- direct lookup (default: any other arg) ---- #
+*)
+    if [[ ! -f "$HELPME_DB" ]]; then
+        echo "[helpme] No index found. Run: helpme reindex"
+        exit 1
+    fi
+    export HELPME_QUERY="$ACTION"
+    if command -v bat &>/dev/null; then
+        "$OLANG" "$(prog_path lookup.O)" "$BACKENDS" | bat --plain --paging=never
+    else
+        "$OLANG" "$(prog_path lookup.O)" "$BACKENDS"
+    fi
+    ;;
+
+esac

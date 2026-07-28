@@ -1,0 +1,211 @@
+#!/usr/bin/env O
+# helpme doctor — surface broken/missing pieces so setup is not tribal knowledge.
+#
+# Env: HELPME_DB, OLANG (optional), HELPME_DIR (optional)
+
+python^(
+import os, shutil, sqlite3, sys, platform
+from pathlib import Path
+
+DB   = os.environ.get("HELPME_DB", os.path.expanduser("~/.local/share/helpme/db/index.db"))
+DIR  = os.environ.get("HELPME_DIR", os.path.expanduser("~/.local/share/helpme"))
+SEP  = "─" * 72
+ok_n = warn_n = fail_n = 0
+lines = []
+
+def section(title):
+    lines.append("")
+    lines.append(f"\033[1;33m{title}\033[0m")
+    lines.append(SEP)
+
+def ok(msg, detail=""):
+    global ok_n
+    ok_n += 1
+    extra = f"  \033[90m{detail}\033[0m" if detail else ""
+    lines.append(f"  \033[32m✓\033[0m {msg}{extra}")
+
+def warn(msg, fix=""):
+    global warn_n
+    warn_n += 1
+    lines.append(f"  \033[33m!\033[0m {msg}")
+    if fix:
+        lines.append(f"      \033[90mfix: {fix}\033[0m")
+
+def fail(msg, fix=""):
+    global fail_n
+    fail_n += 1
+    lines.append(f"  \033[31m✗\033[0m {msg}")
+    if fix:
+        lines.append(f"      \033[90mfix: {fix}\033[0m")
+
+def is_termux():
+    p = os.environ.get("PREFIX", "")
+    return bool(p and "com.termux" in p)
+
+def pkg_hint(pkg):
+    if is_termux():
+        return f"pkg install {pkg}"
+    if shutil.which("apt-get"):
+        return f"sudo apt install {pkg}"
+    if shutil.which("dnf"):
+        return f"sudo dnf install {pkg}"
+    if shutil.which("pacman"):
+        return f"sudo pacman -S {pkg}"
+    if shutil.which("brew"):
+        return f"brew install {pkg}"
+    return f"install {pkg} with your package manager"
+
+lines.append(f"\033[1;32mhelpme doctor\033[0m  \033[90m— is anything invisible because it is missing?\033[0m")
+
+# --- Runtime --- #
+section("Runtime")
+olang = os.environ.get("OLANG", "")
+candidates = [
+    olang,
+    str(Path.home() / "Ostadix-lang/target/release/O"),
+    str(Path.home() / "helpme/Ostadix-lang/target/release/O"),
+    shutil.which("O") or "",
+]
+found_o = next((c for c in candidates if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
+if found_o:
+    ok("Ostadix-lang binary", found_o)
+else:
+    fail("Ostadix-lang binary not found", "cd ~/helpme && ./install.sh")
+
+backends = Path(DIR) / "backends"
+if backends.is_dir() or backends.is_symlink():
+    ok("Backends directory", str(backends))
+else:
+    fail("Backends missing", "run install.sh")
+
+for prog in ("reindex.O", "lookup.O", "ai_explain.O", "search.O", "map.O",
+             "doctor.O", "stats.O", "undoc.O", "topics.O", "system.O", "setup.O"):
+    p = Path(DIR) / prog
+    if p.is_file():
+        ok(prog)
+    else:
+        # also accept repo-local during dev
+        repo = Path.cwd() / prog
+        if repo.is_file():
+            warn(f"{prog} not installed to HELPME_DIR", "re-run install.sh")
+        else:
+            fail(f"{prog} missing", "re-run install.sh")
+
+# --- Core CLI deps --- #
+section("CLI dependencies")
+required = [
+    ("sqlite3", "sqlite", True),
+    ("fzf", "fzf", False),
+]
+optional = [
+    ("man", "man", "manual pages won't be harvested"),
+    ("whatis", "man", "synopses will be thinner"),
+    ("tldr", "tldr", "no community examples"),
+    ("info", "texinfo", "no GNU info pages"),
+    ("bat", "bat", "plain output only"),
+]
+for cmd, pkg, critical in required:
+    path = shutil.which(cmd)
+    if path:
+        ok(cmd, path)
+    elif critical:
+        fail(f"{cmd} not found", pkg_hint(pkg))
+    else:
+        warn(f"{cmd} not found (TUI disabled)", pkg_hint(pkg))
+
+for cmd, pkg, note in optional:
+    path = shutil.which(cmd)
+    if path:
+        ok(cmd, path)
+    else:
+        warn(f"{cmd} not found — {note}", f"helpme setup  (or {pkg_hint(pkg)})")
+
+# --- Index health --- #
+section("Index")
+if not os.path.exists(DB):
+    fail("No index database", "helpme reindex")
+else:
+    ok("Index database", DB)
+    try:
+        con = sqlite3.connect(DB)
+        total = con.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+        if total == 0:
+            warn("Index is empty", "helpme reindex")
+        else:
+            ok(f"{total} commands indexed")
+        # FTS present?
+        fts = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='commands_fts'"
+        ).fetchone()
+        if fts:
+            ok("Full-text search (FTS5) ready")
+        else:
+            warn("No FTS table", "helpme reindex  # rebuilds FTS")
+        undoc = con.execute(
+            """
+            SELECT COUNT(*) FROM commands
+            WHERE IFNULL(man_text,'')='' AND IFNULL(help_short,'')=''
+              AND IFNULL(tldr_text,'')='' AND IFNULL(info_text,'')=''
+            """
+        ).fetchone()[0]
+        if undoc and total:
+            pct = 100 * undoc // total
+            if pct > 40:
+                warn(f"{undoc} commands have no harvested docs ({pct}%)", "helpme undoc")
+            else:
+                ok(f"{undoc} commands without docs ({pct}%)")
+        con.close()
+    except sqlite3.Error as e:
+        fail(f"DB error: {e}", "helpme reindex --force")
+
+# --- PATH sanity --- #
+section("PATH")
+path_dirs = os.environ.get("PATH", "").split(":")
+empty = [d for d in path_dirs if d and not os.path.isdir(d)]
+ok(f"{len(path_dirs)} PATH entries")
+if empty:
+    warn(f"{len(empty)} PATH entries do not exist", "helpme map")
+# local bin
+local_bin = str(Path.home() / ".local/bin")
+if local_bin in path_dirs:
+    ok("~/.local/bin on PATH")
+else:
+    warn("~/.local/bin not on PATH", "export PATH=\"" + local_bin + ":\$PATH\"")
+
+# Termux-specific
+if is_termux():
+    section("Termux")
+    ok("Termux PREFIX", os.environ.get("PREFIX", ""))
+    if not (Path.home() / "storage").is_dir():
+        warn("Shared storage not linked", "termux-setup-storage")
+    else:
+        ok("~/storage present")
+    if not shutil.which("pkg"):
+        fail("pkg not found", "repair Termux install")
+    else:
+        ok("pkg available")
+
+# --- AI optional --- #
+section("AI (optional)")
+ollama = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+lines.append(f"  \033[90mOLLAMA_HOST={ollama}\033[0m")
+lines.append(f"  \033[90mLLAMACPP_HOST={os.environ.get('LLAMACPP_HOST', 'http://localhost:8080')}\033[0m")
+lines.append("  \033[90mAI is optional — helpme ai <cmd> needs a local model server\033[0m")
+
+# --- Summary --- #
+lines.append("")
+lines.append(SEP)
+color = "32" if fail_n == 0 and warn_n == 0 else ("33" if fail_n == 0 else "31")
+lines.append(
+    f"\033[1;{color}mSummary\033[0m  "
+    f"\033[32m{ok_n} ok\033[0m  \033[33m{warn_n} warn\033[0m  \033[31m{fail_n} fail\033[0m"
+)
+if fail_n:
+    lines.append("\033[90mFix the ✗ items first — those block core helpme features.\033[0m")
+elif warn_n:
+    lines.append("\033[90mCore is fine. Warnings are optional visibility upgrades.\033[0m")
+else:
+    lines.append("\033[90mEverything visible is reachable. Try: helpme map · helpme search\033[0m")
+
+__oval_result__ = "\n".join(lines)
+)_python

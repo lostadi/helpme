@@ -1,0 +1,295 @@
+#!/usr/bin/env O
+# helpme topics — curated "hidden knowledge" that is not a binary on PATH.
+# Termux and general CLI concepts people only learn by being told.
+#
+# Env:
+#   HELPME_QUERY — topic id or empty for catalog
+
+python^(
+import os, textwrap
+
+query = os.environ.get("HELPME_QUERY", "").strip().lower()
+SEP = "─" * 72
+
+# Each topic: id, title, tags, body (plain text with light structure)
+TOPICS = [
+    {
+        "id": "path",
+        "title": "PATH — how the shell finds commands",
+        "tags": ["shell", "basics", "invisible"],
+        "body": """
+When you type a command name, the shell walks directories listed in the PATH
+environment variable, in order, and runs the first matching executable.
+
+  echo \$PATH         # see the search list (colon-separated)
+  helpme map          # prettier map of each directory + binary counts
+  type -a ls          # where `ls` resolves (and any shadows)
+  command -v pkg      # absolute path of a command, or empty if missing
+
+Nothing on PATH is "installed for the shell" unless its directory is listed.
+A program can exist on disk and still be invisible to the shell.
+""",
+    },
+    {
+        "id": "builtins",
+        "title": "Shell builtins — commands that are not files",
+        "tags": ["shell", "basics"],
+        "body": """
+Some commands are implemented *inside* the shell (cd, export, alias, set…).
+They never appear as files under /bin — so `ls \$(which cd)` fails.
+
+  type cd             # "cd is a shell builtin"
+  help cd             # bash/zsh help for the builtin
+  helpme cd           # helpme indexes builtins too (after reindex)
+  helpme search directory
+
+`which` only finds external programs. Prefer `type` / `command -v`.
+""",
+    },
+    {
+        "id": "man",
+        "title": "man / whatis / info / tldr — layers of docs",
+        "tags": ["docs", "basics"],
+        "body": """
+CLI documentation is split across tools people rarely discover:
+
+  man tar             # full manual (if package installed)
+  whatis tar          # one-line synopsis
+  info tar            # GNU hypertext manuals
+  tldr tar            # community "common flags" examples
+  tar --help          # built-in short help
+
+helpme harvests all of these into one local index so you can browse without
+already knowing which doc system a tool uses.
+
+  helpme tar
+  helpme search archive
+""",
+    },
+    {
+        "id": "termux",
+        "title": "Termux — Android Linux without root",
+        "tags": ["termux", "android"],
+        "body": """
+Termux is a Linux userspace on Android. Key facts that are not obvious:
+
+  \$PREFIX            # usually /data/data/com.termux/files/usr  (like /usr)
+  \$HOME              # /data/data/com.termux/files/home
+  pkg install foo     # install packages (apt under the hood)
+  termux-change-repo  # pick a mirror if downloads fail
+
+Binaries live under \$PREFIX/bin — that directory must be on PATH (it is by
+default). Android app storage is sandboxed; shared storage needs a one-time
+grant (see topic: storage).
+""",
+    },
+    {
+        "id": "storage",
+        "title": "Termux storage — shared files with Android",
+        "tags": ["termux", "android", "files"],
+        "body": """
+By default Termux cannot see your Photos/Downloads. One command creates
+~/storage/* symlinks after you grant permission in the Android dialog:
+
+  termux-setup-storage
+
+Then:
+
+  ls ~/storage/shared     # often /sdcard
+  ls ~/storage/downloads
+  ls ~/storage/dcim
+
+If ~/storage is missing, helpme map and helpme doctor will flag it.
+Re-run termux-setup-storage after Android permission resets.
+""",
+    },
+    {
+        "id": "pkg",
+        "title": "pkg — installing software on Termux",
+        "tags": ["termux", "packages"],
+        "body": """
+  pkg update                  # refresh package lists
+  pkg search zip              # find package names
+  pkg install zip unzip       # install
+  pkg show git                # package metadata
+  pkg uninstall oldthing
+
+Package name ≠ command name sometimes (e.g. package "vim" → command vim).
+After installing man pages or tldr, refresh helpme:
+
+  helpme reindex
+  # or
+  helpme reindex --force
+""",
+    },
+    {
+        "id": "permissions",
+        "title": "Android permissions Termux may need",
+        "tags": ["termux", "android"],
+        "body": """
+Invisible failures are often permissions:
+
+  Storage     → termux-setup-storage
+  Notifications / sensors / camera → install termux-api + Termux:API app,
+                                    then termux-notification, termux-camera-*, …
+  Battery     → disable battery optimization for Termux if jobs die
+  Overlay     → some UIs need "display over apps"
+
+Check:
+
+  termux-info                 # dump environment (if installed)
+  helpme doctor
+""",
+    },
+    {
+        "id": "shebang",
+        "title": "Scripts, shebangs, and executable bits",
+        "tags": ["shell", "scripts"],
+        "body": """
+A text file becomes a command when:
+
+  1. It is executable:  chmod +x myscript
+  2. It is on PATH *or* you run ./myscript
+  3. It has a shebang:  #!/usr/bin/env bash
+
+  head -1 \$(command -v helpme)    # see a real shebang
+  ls -l \$(command -v pkg)         # see the executable bit
+
+Without +x, the shell says "permission denied".
+Without PATH, the shell says "command not found" even if the file exists.
+""",
+    },
+    {
+        "id": "exit-codes",
+        "title": "Exit codes — success is 0",
+        "tags": ["shell", "basics"],
+        "body": """
+Every command returns an integer status:
+
+  0    success
+  ≠0   failure (2 often misuse, 127 command not found, 130 Ctrl-C)
+
+  true; echo \$?      # 0
+  false; echo \$?     # 1
+  command -v nosuch; echo \$?
+
+Scripts use this with set -e, ||, &&, and if. helpme itself exits non-zero
+when the Ostadix runtime or index is missing so automation can detect it.
+""",
+    },
+    {
+        "id": "env",
+        "title": "Environment variables — configuration you cannot see",
+        "tags": ["shell", "basics"],
+        "body": """
+Programs read configuration from the environment. It is invisible until you:
+
+  export                # list exported vars
+  env | sort            # same, portable
+  echo "\$PREFIX \$HOME \$PATH"
+
+Common ones:
+
+  PATH      command search path
+  HOME      your home directory
+  PREFIX    Termux userspace root
+  EDITOR    default text editor
+  PAGER     man/less pager
+  LANG      locale / unicode behavior
+
+helpme uses HELPME_DB, HELPME_DIR, OLANG, HELPME_WORKERS, OLLAMA_HOST, …
+""",
+    },
+    {
+        "id": "helpme",
+        "title": "helpme — this tool's own map",
+        "tags": ["helpme"],
+        "body": """
+Goal: make CLI knowledge visible so Termux/any shell needs less tribal lore.
+
+  helpme                  fuzzy browse every indexed command (fzf)
+  helpme <cmd>            show harvested docs for one command
+  helpme search <words>   find by description, not name
+  helpme map              show PATH, Termux, doc tools, coverage
+  helpme doctor           check missing deps / broken setup
+  helpme stats            index coverage numbers
+  helpme undoc            commands still without any docs
+  helpme topics           this catalog
+  helpme topic storage    one topic by id
+  helpme reindex          (re)scan PATH + builtins
+  helpme ai <cmd>         plain-language summary (local LLM)
+
+Data lives in ~/.local/share/helpme/db/index.db (override with HELPME_DB).
+""",
+    },
+]
+
+by_id = {t["id"]: t for t in TOPICS}
+
+
+def fmt_topic(t):
+    lines = [
+        f"\033[1;32m{t['id']}\033[0m  \033[1m{t['title']}\033[0m",
+        SEP,
+        f"\033[90mtags: {', '.join(t['tags'])}\033[0m",
+        "",
+        textwrap.dedent(t["body"]).strip(),
+        "",
+        f"\033[90mhelpme topics          — catalog\033[0m",
+        f"\033[90mhelpme search {t['id']}  — related commands in the index\033[0m",
+    ]
+    return "\n".join(lines)
+
+
+def fmt_catalog(filter_tag=None):
+    lines = [
+        f"\033[1;32mhelpme topics\033[0m  \033[90mhidden knowledge that is not a binary\033[0m",
+        SEP,
+        "These are concepts you normally only learn from people, not `man`.",
+        "",
+    ]
+    shown = 0
+    for t in TOPICS:
+        if filter_tag and filter_tag not in t["tags"] and filter_tag != t["id"]:
+            continue
+        tags = ", ".join(t["tags"])
+        lines.append(f"  \033[1;32m{t['id']:<14}\033[0m {t['title']}")
+        lines.append(f"  \033[90m{'':14} {tags}\033[0m")
+        shown += 1
+    if not shown:
+        lines.append(f"  No topics match {filter_tag!r}.")
+    lines.append("")
+    lines.append("\033[90mOpen:  helpme topic <id>   e.g. helpme topic storage\033[0m")
+    lines.append("\033[90mAlso:  helpme map · helpme doctor · helpme search\033[0m")
+    return "\n".join(lines)
+
+
+if not query or query in ("topics", "list", "ls", "--list"):
+    output = fmt_catalog()
+elif query in by_id:
+    output = fmt_topic(by_id[query])
+else:
+    # treat as tag filter or fuzzy id
+    matches = [t for t in TOPICS if query in t["id"] or query in t["title"].lower()
+               or query in t["tags"]]
+    if len(matches) == 1:
+        output = fmt_topic(matches[0])
+    elif matches:
+        output = fmt_catalog(filter_tag=query)
+        # fmt_catalog with tag may miss title matches — build manual list
+        lines = [
+            f"\033[1;32mhelpme topics\033[0m  matches for \033[1m{query}\033[0m",
+            SEP,
+        ]
+        for t in matches:
+            lines.append(f"  \033[1;32m{t['id']:<14}\033[0m {t['title']}")
+        lines.append("")
+        lines.append("\033[90mOpen: helpme topic <id>\033[0m")
+        output = "\n".join(lines)
+    else:
+        output = (
+            f"[helpme topics] unknown topic {query!r}\n\n" + fmt_catalog()
+        )
+
+__oval_result__ = output
+)_python

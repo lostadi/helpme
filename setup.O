@@ -1,0 +1,477 @@
+#!/usr/bin/env O
+# helpme setup — install + upgrade all optional deps for *this* system.
+# Detects package manager and maps helpme optionals to local package names.
+#
+# Env:
+#   HELPME_SETUP_DRY=1   — print plan only, do not install
+#   HELPME_SETUP_YES=1   — non-interactive (default: 1 when not a TTY is N/A; always auto)
+#   HELPME_QUERY         — "dry-run" | "upgrade" | "install" | "all" (default all)
+
+python^(
+import os, shutil, subprocess, sys, platform
+from pathlib import Path
+
+DRY = os.environ.get("HELPME_SETUP_DRY", "0") == "1"
+QUERY = (os.environ.get("HELPME_QUERY") or "all").strip().lower()
+if QUERY in ("dry", "dry-run", "plan", "--dry-run"):
+    DRY = True
+if QUERY in ("", "setup", "deps", "optionals"):
+    QUERY = "all"
+
+SEP = "─" * 72
+lines = []
+log_lines = []
+
+
+def log(msg, color=None):
+    if color:
+        s = f"\033[{color}m{msg}\033[0m"
+    else:
+        s = msg
+    print(s, file=sys.stderr, flush=True)
+    log_lines.append(msg)
+
+
+def which(name):
+    return shutil.which(name)
+
+
+def is_termux():
+    p = os.environ.get("PREFIX", "")
+    return bool(p and "com.termux" in p)
+
+
+# Package managers spam huge apt progress on stdout; that must NOT go through
+# the Ostadix Python wire (frame size limits). Always log to a file.
+LOG_PATH = os.path.join(
+    os.environ.get("HELPME_DIR", os.path.expanduser("~/.local/share/helpme")),
+    "setup.log",
+)
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+
+def run(argv, check=False):
+    log(f"  $ {' '.join(argv)}")
+    if DRY:
+        return 0, ""
+    env = os.environ.copy()
+    env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+    env.setdefault("APT_LISTCHANGES_FRONTEND", "none")
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8", errors="replace") as logf:
+            logf.write(f"\n>>> {' '.join(argv)}\n")
+            logf.flush()
+            p = subprocess.run(
+                argv,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+        if p.returncode != 0:
+            # show last few log lines on stderr only (short)
+            try:
+                tail = Path(LOG_PATH).read_text(errors="replace").splitlines()[-8:]
+                for ln in tail:
+                    log(f"    | {ln[:120]}", "90")
+            except Exception:
+                pass
+        return p.returncode, ""
+    except FileNotFoundError as e:
+        log(f"  ! not found: {e}", "31")
+        return 127, str(e)
+    except Exception as e:
+        log(f"  ! {e}", "31")
+        return 1, str(e)
+
+
+def tool_present(tool):
+    """Map logical tool → binary check."""
+    if tool == "man":
+        return bool(which("man") or which("mandoc"))
+    if tool == "tldr":
+        return bool(which("tldr") or which("tealdeer"))
+    if tool == "info":
+        return bool(which("info"))
+    if tool == "sqlite3":
+        return bool(which("sqlite3"))
+    return bool(which(tool))
+
+
+# Logical optionals helpme uses for better visibility
+# (name, why)
+LOGICAL = [
+    ("fzf", "fuzzy TUI for helpme"),
+    ("man", "manual pages harvested by reindex"),
+    ("tldr", "community examples harvested by reindex"),
+    ("bat", "syntax-highlighted lookup output"),
+    ("info", "GNU info pages harvested by reindex"),
+    ("sqlite3", "index database CLI"),
+]
+
+
+def detect_pm():
+    """Return (pm_id, install_cmd_builder, upgrade_all_cmd, notes)."""
+    if is_termux() and which("pkg"):
+        def install(pkgs):
+            # pkg is a wrapper; -y is passed through to apt
+            return ["pkg", "install", "-y", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return ["pkg", "upgrade", "-y"]
+        def update():
+            # Termux: `pkg update` refreshes indexes (no -y needed / may confuse apt)
+            return ["pkg", "update"]
+        return {
+            "id": "termux-pkg",
+            "title": "Termux pkg",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": False,
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["mandoc", "manpages"],
+                "tldr": ["tealdeer"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    if which("brew"):
+        def install(pkgs):
+            return ["brew", "install", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return ["brew", "upgrade", *pkgs] if pkgs else ["brew", "upgrade"]
+        def update():
+            return ["brew", "update"]
+        return {
+            "id": "brew",
+            "title": "Homebrew",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": False,
+            "map": {
+                "fzf": ["fzf"],
+                "man": [],  # ship with macOS; linuxbrew may differ
+                "tldr": ["tldr"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    if which("apt-get") or which("apt"):
+        apt = "apt" if which("apt") else "apt-get"
+        sudo = [] if is_termux() or os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + [apt, "install", "-y", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + [apt, "install", "--only-upgrade", "-y", *pkgs] if pkgs else sudo + [apt, "upgrade", "-y"]
+        def update():
+            return sudo + [apt, "update", "-y"] if apt == "apt" else sudo + [apt, "update"]
+        return {
+            "id": "apt",
+            "title": "apt (Debian/Ubuntu)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["man-db", "manpages"],
+                "tldr": ["tldr"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite3"],
+            },
+        }
+
+    if which("dnf"):
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + ["dnf", "install", "-y", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + ["dnf", "upgrade", "-y", *pkgs] if pkgs else sudo + ["dnf", "upgrade", "-y"]
+        def update():
+            return sudo + ["dnf", "makecache"]
+        return {
+            "id": "dnf",
+            "title": "dnf (Fedora/RHEL)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["man-db", "man-pages"],
+                "tldr": ["tealdeer"],
+                "bat": ["bat"],
+                "info": ["info", "texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    if which("pacman"):
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + ["pacman", "-S", "--noconfirm", "--needed", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + ["pacman", "-Syu", "--noconfirm"]
+        def update():
+            return sudo + ["pacman", "-Sy", "--noconfirm"]
+        return {
+            "id": "pacman",
+            "title": "pacman (Arch)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["man-db", "man-pages"],
+                "tldr": ["tldr"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    if which("apk"):
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + ["apk", "add", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + ["apk", "upgrade", *pkgs] if pkgs else sudo + ["apk", "upgrade"]
+        def update():
+            return sudo + ["apk", "update"]
+        return {
+            "id": "apk",
+            "title": "apk (Alpine)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["mandoc", "man-pages"],
+                "tldr": ["tealdeer"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    if which("zypper"):
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + ["zypper", "--non-interactive", "install", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + ["zypper", "--non-interactive", "update", *pkgs] if pkgs else sudo + ["zypper", "--non-interactive", "update"]
+        def update():
+            return sudo + ["zypper", "--non-interactive", "refresh"]
+        return {
+            "id": "zypper",
+            "title": "zypper (openSUSE)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["man", "man-pages"],
+                "tldr": ["tealdeer"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite3"],
+            },
+        }
+
+    if which("xbps-install"):
+        sudo = [] if os.geteuid() == 0 else ["sudo"]
+        def install(pkgs):
+            return sudo + ["xbps-install", "-Sy", *pkgs]
+        def upgrade_pkgs(pkgs):
+            return sudo + ["xbps-install", "-Su"]
+        def update():
+            return sudo + ["xbps-install", "-S"]
+        return {
+            "id": "xbps",
+            "title": "xbps (Void)",
+            "update": update,
+            "install": install,
+            "upgrade": upgrade_pkgs,
+            "sudo": bool(sudo),
+            "map": {
+                "fzf": ["fzf"],
+                "man": ["man-pages", "mdocml"],
+                "tldr": ["tealdeer"],
+                "bat": ["bat"],
+                "info": ["texinfo"],
+                "sqlite3": ["sqlite"],
+            },
+        }
+
+    return None
+
+
+# --- main --- #
+# truncate log at start of a real run
+if not DRY:
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"# helpme setup log\n")
+    except Exception:
+        pass
+
+lines.append(f"\033[1;32mhelpme setup\033[0m  \033[90m— install + upgrade optionals for this system\033[0m")
+if DRY:
+    lines.append("\033[33mDRY RUN — no packages will be changed\033[0m")
+lines.append(SEP)
+
+pm = detect_pm()
+if not pm:
+    lines.append("\033[31mNo supported package manager found on PATH.\033[0m")
+    lines.append("Supported: pkg (Termux), apt, brew, dnf, pacman, apk, zypper, xbps")
+    lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+    __oval_result__ = "\n".join(lines)
+else:
+    lines.append(f"  Package manager: \033[1;36m{pm['title']}\033[0m  ({pm['id']})")
+    lines.append(f"  Host: {platform.system()} {platform.machine()}"
+                 + (" · Termux" if is_termux() else ""))
+    if pm.get("sudo"):
+        lines.append("  \033[90mCommands will use sudo when needed.\033[0m")
+    lines.append("")
+
+    # Plan per logical tool
+    to_install = []   # package names
+    already = []      # logical tools present
+    missing_map = []  # logical tools with no package mapping
+    plan_rows = []
+
+    for tool, why in LOGICAL:
+        pkgs = pm["map"].get(tool, [])
+        present = tool_present(tool)
+        if not pkgs:
+            status = "present" if present else "no-package-mapping"
+            if not present:
+                missing_map.append(tool)
+            plan_rows.append((tool, status, pkgs, why))
+            if present:
+                already.append(tool)
+            continue
+        if present:
+            already.append(tool)
+            plan_rows.append((tool, "upgrade", pkgs, why))
+            for p in pkgs:
+                if p not in to_install:
+                    to_install.append(p)
+        else:
+            plan_rows.append((tool, "install", pkgs, why))
+            for p in pkgs:
+                if p not in to_install:
+                    to_install.append(p)
+
+    lines.append(f"\033[1;33mPlan\033[0m")
+    lines.append(SEP)
+    for tool, status, pkgs, why in plan_rows:
+        if status == "install":
+            mark = "\033[33minstall\033[0m"
+        elif status == "upgrade":
+            mark = "\033[34mupgrade\033[0m"
+        elif status == "present":
+            mark = "\033[32mpresent\033[0m"
+        else:
+            mark = "\033[31mskip\033[0m"
+        pkg_s = ", ".join(pkgs) if pkgs else "—"
+        lines.append(f"  {tool:<10} {mark:<24} pkgs: {pkg_s}")
+        lines.append(f"             \033[90m{why}\033[0m")
+
+    lines.append("")
+    lines.append(f"  Packages to ensure: \033[1m{', '.join(to_install) if to_install else '(none)'}\033[0m")
+    lines.append("")
+
+    # Execute
+    lines.append(f"\033[1;33mExecute\033[0m")
+    lines.append(SEP)
+    errors = 0
+
+    if not to_install and QUERY != "all":
+        log("Nothing to install/upgrade.", "32")
+    else:
+        # 1) update package indexes
+        log("[1/3] Update package indexes…", "33")
+        rc, _ = run(pm["update"]())
+        if rc != 0:
+            errors += 1
+            log(f"  update exited {rc} (continuing)", "33")
+
+        # 2) upgrade packages (system or targets)
+        log("[2/3] Upgrade…", "33")
+        up_cmd = pm["upgrade"](to_install)
+        rc, _ = run(up_cmd)
+        if rc != 0:
+            errors += 1
+            log(f"  upgrade exited {rc} (continuing)", "33")
+
+        # 3) install any still missing
+        log("[3/3] Install optionals…", "33")
+        if to_install:
+            rc, _ = run(pm["install"](to_install))
+            if rc != 0:
+                errors += 1
+                log(f"  install exited {rc}", "31")
+                # Fallback: try one-by-one so one missing name doesn't abort all
+                log("  Retrying packages one-by-one…", "33")
+                for pkg in to_install:
+                    rc1, _ = run(pm["install"]([pkg]))
+                    if rc1 != 0:
+                        log(f"  failed: {pkg}", "31")
+                        errors += 1
+                    else:
+                        log(f"  ok: {pkg}", "32")
+        else:
+            log("  (no packages mapped)", "90")
+
+    # Verify
+    lines.append("")
+    lines.append(f"\033[1;33mVerify\033[0m")
+    lines.append(SEP)
+    ok_n = warn_n = 0
+    for tool, why in LOGICAL:
+        present = tool_present(tool)
+        path = which(tool) or which("mandoc" if tool == "man" else "") or which("tealdeer" if tool == "tldr" else "") or ""
+        if tool == "man" and not path:
+            path = which("man") or which("mandoc") or ""
+        if tool == "tldr" and not path:
+            path = which("tldr") or which("tealdeer") or ""
+        if present:
+            ok_n += 1
+            lines.append(f"  \033[32m✓\033[0m {tool:<10} {path or 'ok'}")
+        else:
+            warn_n += 1
+            pkgs = pm["map"].get(tool) or []
+            hint = f" (wanted: {', '.join(pkgs)})" if pkgs else " (no mapping on this OS)"
+            lines.append(f"  \033[33m!\033[0m {tool:<10} still missing{hint}")
+
+    lines.append("")
+    color = "32" if warn_n == 0 and errors == 0 else "33"
+    lines.append(
+        f"\033[1;{color}mDone\033[0m  \033[32m{ok_n} ready\033[0m  "
+        f"\033[33m{warn_n} missing\033[0m  errors={errors}"
+        + ("  \033[33m[dry-run]\033[0m" if DRY else "")
+    )
+    if not DRY:
+        lines.append(f"\033[90mFull log: {LOG_PATH}\033[0m")
+    if not DRY and ok_n:
+        lines.append("")
+        lines.append("\033[90mHarvest new docs into the index:\033[0m")
+        lines.append("  \033[1;32mhelpme reindex --force\033[0m")
+        lines.append("\033[90mThen: helpme doctor · helpme map · helpme search <idea>\033[0m")
+    if DRY:
+        lines.append("")
+        lines.append("\033[90mApply for real:  helpme setup\033[0m")
+
+    __oval_result__ = "\n".join(lines)
+)_python
