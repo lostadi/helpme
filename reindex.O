@@ -7,9 +7,9 @@
 #   HELPME_FORCE — "1" to re-index already-seen entries
 #   HELPME_WORKERS — parallel harvest workers (default 16)
 #
-# Note: all logic lives in Python blocks because O-lang parses $IDENT inside
+# Note: all logic lives in Python blocks because OSTADIX parses $IDENT inside
 # bash blocks as binding references, making bash vars conflict. Python's exec()
-# is opaque to the O-lang parser.
+# is opaque to the OSTADIX parser.
 
 python^(
 import os, sqlite3, subprocess, sys, stat, datetime, re, shutil

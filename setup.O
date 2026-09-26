@@ -42,7 +42,7 @@ def is_termux():
 
 
 # Package managers spam huge apt progress on stdout; that must NOT go through
-# the Ostadix Python wire (frame size limits). Always log to a file.
+# the OSTADIX Python wire (frame size limits). Always log to a file.
 LOG_PATH = os.path.join(
     os.environ.get("HELPME_DIR", os.path.expanduser("~/.local/share/helpme")),
     "setup.log",

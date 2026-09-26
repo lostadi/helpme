@@ -62,15 +62,15 @@ section("Runtime")
 olang = os.environ.get("OLANG", "")
 candidates = [
     olang,
-    str(Path.home() / "Ostadix-lang/target/release/O"),
-    str(Path.home() / "helpme/Ostadix-lang/target/release/O"),
+    str(Path.home() / "OSTADIX/target/release/O"),
+    str(Path.home() / "helpme/OSTADIX/target/release/O"),
     shutil.which("O") or "",
 ]
 found_o = next((c for c in candidates if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 if found_o:
-    ok("Ostadix-lang binary", found_o)
+    ok("OSTADIX binary", found_o)
 else:
-    fail("Ostadix-lang binary not found", "cd ~/helpme && ./install.sh")
+    fail("OSTADIX binary not found", "cd ~/helpme && ./install.sh")
 
 backends = Path(DIR) / "backends"
 if backends.is_dir() or backends.is_symlink():

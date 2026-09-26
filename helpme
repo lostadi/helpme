@@ -28,7 +28,7 @@
 # Env:
 #   HELPME_DIR     where .O programs and the SQLite DB live
 #   HELPME_DB      path to index.db (default: $HELPME_DIR/db/index.db)
-#   OLANG          path to the Ostadix-lang runtime binary
+#   OLANG          path to the OSTADIX runtime binary
 #   HELPME_WORKERS parallel reindex workers (default 16)
 #   HELPME_LIMIT   max rows for search/undoc
 #   OLLAMA_HOST / LLAMACPP_HOST / HELPME_AI_MODEL   AI backends
@@ -37,7 +37,7 @@ set -euo pipefail
 
 # --- Config --- #
 HELPME_DIR="${HELPME_DIR:-${HOME}/.local/share/helpme}"
-OLANG="${OLANG:-${HOME}/Ostadix-lang/target/release/O}"
+OLANG="${OLANG:-${HOME}/OSTADIX/target/release/O}"
 BACKENDS="${HELPME_DIR}/backends"
 export HELPME_DB="${HELPME_DB:-${HELPME_DIR}/db/index.db}"
 export HELPME_DIR
@@ -87,7 +87,7 @@ if [[ ! -x "$OLANG" ]]; then
     if command -v O &>/dev/null; then
         OLANG="$(command -v O)"
     else
-        echo "[helpme] Ostadix-lang binary not found at: $OLANG"
+        echo "[helpme] OSTADIX binary not found at: $OLANG"
         echo "         Run install.sh to build it, or set OLANG=/path/to/O"
         exit 1
     fi
@@ -95,8 +95,8 @@ fi
 
 if [[ ! -d "$BACKENDS" ]]; then
     # Dev convenience: use vendored backends next to repo
-    if [[ -d "${REPO_DIR}/Ostadix-lang/backends" ]]; then
-        BACKENDS="${REPO_DIR}/Ostadix-lang/backends"
+    if [[ -d "${REPO_DIR}/OSTADIX/backends" ]]; then
+        BACKENDS="${REPO_DIR}/OSTADIX/backends"
     else
         echo "[helpme] Backends dir not found at: $BACKENDS"
         echo "         Run install.sh to set up the directory structure."
@@ -110,7 +110,7 @@ ACTION="${1:-tui}"
 case "$ACTION" in
 
 --version|-V)
-    echo "helpme $VERSION (Ostadix-lang runtime: $OLANG)"
+    echo "helpme $VERSION (OSTADIX runtime: $OLANG)"
     exit 0
     ;;
 

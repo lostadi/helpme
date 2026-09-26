@@ -174,7 +174,7 @@ Every command returns an integer status:
   command -v nosuch; echo \$?
 
 Scripts use this with set -e, ||, &&, and if. helpme itself exits non-zero
-when the Ostadix runtime or index is missing so automation can detect it.
+when the OSTADIX runtime or index is missing so automation can detect it.
 """,
     },
     {

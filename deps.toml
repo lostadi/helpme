@@ -1,19 +1,19 @@
 # helpme runtime dependencies
-# Ostadix-lang is required — every .O program runs on its `O` binary.
+# OSTADIX is required — every .O program runs on its `O` binary.
 
-[dependencies.ostadix-lang]
-name = "Ostadix-lang"
-git = "https://github.com/lostadi/Ostadix-lang.git"
-path = "Ostadix-lang"
+[dependencies.ostadix]
+name = "OSTADIX"
+git = "https://github.com/lostadi/OSTADIX.git"
+path = "OSTADIX"
 required = true
 role = "Runtime for .O programs (binary `O` + backends/)"
-build = "cargo build --release --manifest-path=Ostadix-lang/Cargo.toml"
-binary = "Ostadix-lang/target/release/O"
-backends = "Ostadix-lang/backends"
+build = "cargo build --release --manifest-path=OSTADIX/Cargo.toml"
+binary = "OSTADIX/target/release/O"
+backends = "OSTADIX/backends"
 
 [dependencies.python3]
 required = true
-role = "Ostadix Python backend used by most .O programs"
+role = "OSTADIX Python backend used by most .O programs"
 
 [dependencies.sqlite3]
 required = true
@@ -21,7 +21,7 @@ role = "Local command index database"
 
 [dependencies.rust]
 required = true
-role = "Toolchain to build Ostadix-lang (cargo / rustc)"
+role = "Toolchain to build OSTADIX (cargo / rustc)"
 url = "https://rustup.rs"
 
 # Installed/upgraded per-OS by: helpme setup

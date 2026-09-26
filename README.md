@@ -4,7 +4,7 @@
 knowledge to use Termux or any CLI.
 
 `helpme` is a local command index and machine guide. It is implemented in
-**[Ostadix-lang](https://github.com/lostadi/Ostadix-lang)** (`.O` programs) with a
+**[OSTADIX](https://github.com/lostadi/OSTADIX)** (`.O` programs) with a
 thin bash launcher. It harvests man / whatis / `--help` / tldr / info, indexes
 shell builtins, documents package managers, and teaches the commands for the
 most important everyday tasks on *this* system.
@@ -17,20 +17,20 @@ most important everyday tasks on *this* system.
 
 | Dependency | Role | How helpme gets it |
 |------------|------|--------------------|
-| **[Ostadix-lang](https://github.com/lostadi/Ostadix-lang)** | Runtime for every `.O` program (`O` binary + language backends) | **Git submodule** at `./Ostadix-lang` (or cloned/built by `install.sh`) |
-| **Rust / cargo** | Build Ostadix-lang | [rustup](https://rustup.rs) |
-| **Python 3** | Ostadix Python backend (logic in most `.O` files) | OS package / Termux `pkg install python` |
+| **[OSTADIX](https://github.com/lostadi/OSTADIX)** | Runtime for every `.O` program (`O` binary + language backends) | `./OSTADIX` if present, otherwise `~/OSTADIX` (cloned and built by `install.sh`) |
+| **Rust / cargo** | Build OSTADIX | [rustup](https://rustup.rs) |
+| **Python 3** | OSTADIX Python backend (logic in most `.O` files) | OS package / Termux `pkg install python` |
 | **sqlite3** | Local index (`~/.local/share/helpme/db/index.db`) | Usually preinstalled; else OS package |
 
-Ostadix-lang is the **primary runtime dependency**. Without a built `O` binary,
+OSTADIX is the **primary runtime dependency**. Without a built `O` binary,
 helpme cannot run.
 
 ```text
 helpme/
 ├── helpme              # bash launcher
-├── install.sh          # bootstrap (builds Ostadix-lang, installs .O programs)
-├── *.O                 # Ostadix-lang programs
-└── Ostadix-lang/       # REQUIRED dep (git submodule → github.com/lostadi/Ostadix-lang)
+├── install.sh          # bootstrap (builds OSTADIX, installs .O programs)
+├── *.O                 # OSTADIX programs
+└── OSTADIX/            # optional checkout; otherwise ~/OSTADIX
     ├── target/release/O
     └── backends/
 ```
@@ -54,22 +54,15 @@ helpme/
 ## Quick start
 
 ```bash
-# Clone with the Ostadix-lang dependency
-git clone --recurse-submodules https://github.com/lostadi/helpme.git ~/helpme
+git clone https://github.com/lostadi/helpme.git ~/helpme
 cd ~/helpme
-./install.sh
-```
-
-If you already cloned without submodules:
-
-```bash
-git submodule update --init --recursive
 ./install.sh
 ```
 
 `install.sh` will:
 
-1. Ensure **Ostadix-lang** is present (`./Ostadix-lang` or clone) and
+1. Ensure **OSTADIX** is present (`./OSTADIX`, or `~/OSTADIX`, cloning
+   https://github.com/lostadi/OSTADIX.git when the tree is missing) and
    `cargo build --release` → `O` binary  
 2. Install all `.O` programs to `~/.local/share/helpme/`  
 3. Install the `helpme` wrapper to `~/.local/bin/helpme`  
@@ -95,8 +88,8 @@ helpme              # fuzzy-browse every indexed command
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `OLANG` | `~/Ostadix-lang/target/release/O` or baked path | Path to Ostadix-lang `O` binary |
-| `OLANG_DIR` | `./Ostadix-lang` or `~/Ostadix-lang` | Tree used by `install.sh` |
+| `OLANG` | `~/OSTADIX/target/release/O` or baked path | Path to OSTADIX `O` binary |
+| `OLANG_DIR` | `./OSTADIX` or `~/OSTADIX` | Tree used by `install.sh` |
 | `HELPME_DIR` | `~/.local/share/helpme` | Installed `.O` programs + DB |
 | `HELPME_DB` | `$HELPME_DIR/db/index.db` | SQLite index |
 | `HELPME_WORKERS` | `16` | Parallel reindex workers |
@@ -150,7 +143,7 @@ helpme --help
 
 ## How it works
 
-1. **Ostadix-lang** runs each `.O` program (Python / SQL / … backends).  
+1. **OSTADIX** runs each `.O` program (Python / SQL / … backends).  
 2. `reindex.O` scans `$PATH` + shell builtins and harvests documentation.  
 3. Results live in SQLite with **FTS5** full-text search.  
 4. The bash wrapper `helpme` dispatches subcommands to the right `.O` file.
@@ -171,21 +164,21 @@ helpme --help
 
 ---
 
-## Ostadix-lang dependency details
+## OSTADIX dependency details
 
-- **Repo:** https://github.com/lostadi/Ostadix-lang  
-- **Pinned path:** `./Ostadix-lang` (git submodule; see [`.gitmodules`](.gitmodules))  
-- **Binary:** `Ostadix-lang/target/release/O`  
-- **Backends:** `Ostadix-lang/backends/` (symlinked into `HELPME_DIR` on install)
+- **Repo:** https://github.com/lostadi/OSTADIX  
+- **Checkout:** `./OSTADIX` if that tree is in the helpme repo, otherwise `~/OSTADIX`  
+- **Binary:** `$OLANG_DIR/target/release/O`  
+- **Backends:** `$OLANG_DIR/backends/` (symlinked into `HELPME_DIR` on install)
 
 Build only:
 
 ```bash
-cargo build --release --manifest-path=Ostadix-lang/Cargo.toml
+cargo build --release --manifest-path="${OLANG_DIR:-$HOME/OSTADIX}/Cargo.toml"
 ```
 
 Logic lives in `python^(...)_python` blocks (and `O^(...)_O` in `stats.O`).
-Ostadix parses `$IDENT` anywhere in a block as a binding — use `\$IDENT` when
+OSTADIX parses `$IDENT` anywhere in a block as a binding — use `\$IDENT` when
 a backend must see a literal `$` (e.g. shell `$PATH`).
 
 ---
@@ -220,5 +213,5 @@ docs are harvested.
 
 MIT
 
-Ostadix-lang is a separate project with its own license; see
-`Ostadix-lang/LICENSE` when the submodule is checked out.
+OSTADIX is a separate project with its own license; see
+`~/OSTADIX/LICENSE` (or `./OSTADIX/LICENSE` when that checkout is present).

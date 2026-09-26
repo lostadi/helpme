@@ -1,6 +1,6 @@
 #!/usr/bin/env O
 # helpme stats — coverage report for the local command index.
-# Uses Ostadix sql + python: query in SQL, present in Python.
+# Uses OSTADIX sql + python: query in SQL, present in Python.
 
 O^(
 let report = python^(

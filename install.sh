@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # helpme install.sh — bootstrap helpme on any machine
 #
-# Required dependency: Ostadix-lang
-#   https://github.com/lostadi/Ostadix-lang
-#   shipped as git submodule at ./Ostadix-lang (see .gitmodules, deps.toml)
+# Required dependency: OSTADIX
+#   https://github.com/lostadi/OSTADIX
+#   checkout at ./OSTADIX if present, otherwise ~/OSTADIX (see deps.toml)
 #
 # Usage:
-#   git clone --recurse-submodules https://github.com/lostadi/helpme.git ~/helpme
+#   git clone https://github.com/lostadi/helpme.git ~/helpme
 #   cd ~/helpme && ./install.sh
 #
 # Environment overrides:
-#   OLANG_DIR    — where to find/clone Ostadix-lang
-#                  (default: ./Ostadix-lang if present, else ~/Ostadix-lang)
+#   OLANG_DIR    — where to find/clone OSTADIX
+#                  (default: ./OSTADIX if present, else ~/OSTADIX)
 #   HELPME_DIR   — where helpme data lives       (default: ~/.local/share/helpme)
 #   HELPME_BIN   — where to install the wrapper  (default: ~/.local/bin)
 
@@ -19,15 +19,15 @@ set -euo pipefail
 
 HELPME_DIR="${HELPME_DIR:-${HOME}/.local/share/helpme}"
 HELPME_BIN="${HELPME_BIN:-${HOME}/.local/bin}"
-OLANG_REPO="https://github.com/lostadi/Ostadix-lang.git"
+OLANG_REPO="https://github.com/lostadi/OSTADIX.git"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prefer vendored/submodule Ostadix-lang next to install.sh, then ~/Ostadix-lang
+# Prefer a checkout next to install.sh, then ~/OSTADIX
 if [[ -z "${OLANG_DIR:-}" ]]; then
-    if [[ -f "${REPO_DIR}/Ostadix-lang/Cargo.toml" ]]; then
-        OLANG_DIR="${REPO_DIR}/Ostadix-lang"
+    if [[ -f "${REPO_DIR}/OSTADIX/Cargo.toml" ]]; then
+        OLANG_DIR="${REPO_DIR}/OSTADIX"
     else
-        OLANG_DIR="${HOME}/Ostadix-lang"
+        OLANG_DIR="${HOME}/OSTADIX"
     fi
 fi
 OLANG_BIN="${OLANG_DIR}/target/release/O"
@@ -36,52 +36,52 @@ log()  { printf '\033[1;32m[helpme]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[helpme]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[helpme]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# --- Step 0: Ostadix-lang submodule (required dependency) --- #
+# --- Step 0: OSTADIX submodule (required dependency) --- #
 if [[ -f "${REPO_DIR}/.gitmodules" ]] && [[ -d "${REPO_DIR}/.git" ]]; then
-    if [[ ! -f "${REPO_DIR}/Ostadix-lang/Cargo.toml" ]]; then
-        log "Initializing Ostadix-lang git submodule (required dependency)..."
+    if [[ ! -f "${REPO_DIR}/OSTADIX/Cargo.toml" ]]; then
+        log "Initializing OSTADIX git submodule (required dependency)..."
         git -C "$REPO_DIR" submodule update --init --recursive \
-            || die "Failed to init Ostadix-lang submodule. Run: git submodule update --init --recursive"
+            || die "Failed to init OSTADIX submodule. Run: git submodule update --init --recursive"
     fi
 fi
 
-# --- Step 1: Ostadix-lang (build) --- #
-log "Checking Ostadix-lang (required dependency)..."
+# --- Step 1: OSTADIX (build) --- #
+log "Checking OSTADIX (required dependency)..."
 if [[ -x "$OLANG_BIN" ]]; then
-    log "Ostadix-lang binary found: $OLANG_BIN"
+    log "OSTADIX binary found: $OLANG_BIN"
 else
     if [[ ! -f "${OLANG_DIR}/Cargo.toml" ]]; then
         if [[ -d "$OLANG_DIR" ]] && [[ ! -d "$OLANG_DIR/.git" ]] && [[ ! -f "$OLANG_DIR/.git" ]]; then
-            die "OLANG_DIR exists but is not an Ostadix-lang tree: $OLANG_DIR"
+            die "OLANG_DIR exists but is not an OSTADIX tree: $OLANG_DIR"
         fi
-        log "Cloning Ostadix-lang into $OLANG_DIR..."
+        log "Cloning OSTADIX into $OLANG_DIR..."
         log "  (required dep: $OLANG_REPO)"
         git clone "$OLANG_REPO" "$OLANG_DIR"
     elif [[ -d "$OLANG_DIR/.git" ]] || [[ -f "$OLANG_DIR/.git" ]]; then
-        log "Updating Ostadix-lang..."
+        log "Updating OSTADIX..."
         git -C "$OLANG_DIR" pull --ff-only || warn "git pull failed — using existing tree"
     else
-        log "Using local Ostadix-lang tree: $OLANG_DIR"
+        log "Using local OSTADIX tree: $OLANG_DIR"
     fi
-    command -v cargo &>/dev/null || die "cargo not found (needed to build Ostadix-lang). Install Rust: https://rustup.rs"
-    log "Building Ostadix-lang (release)..."
+    command -v cargo &>/dev/null || die "cargo not found (needed to build OSTADIX). Install Rust: https://rustup.rs"
+    log "Building OSTADIX (release)..."
     cargo build --release --manifest-path="${OLANG_DIR}/Cargo.toml"
     [[ -x "$OLANG_BIN" ]] || die "Build done but binary missing at $OLANG_BIN"
-    log "Ostadix-lang ready: $OLANG_BIN"
+    log "OSTADIX ready: $OLANG_BIN"
 fi
 
 # --- Step 2: directory structure --- #
 log "Setting up ${HELPME_DIR}..."
 mkdir -p "${HELPME_DIR}/db" "${HELPME_BIN}"
 
-# Symlink backends from Ostadix-lang repo
+# Symlink backends from OSTADIX repo
 if [[ ! -d "${OLANG_DIR}/backends" ]]; then
     die "Backends directory missing: ${OLANG_DIR}/backends"
 fi
 ln -sfn "${OLANG_DIR}/backends" "${HELPME_DIR}/backends"
 log "Backends → ${OLANG_DIR}/backends"
 
-# --- Step 3: copy .O programs (Ostadix-lang surface area) --- #
+# --- Step 3: copy .O programs (OSTADIX surface area) --- #
 PROGS=(
     reindex.O
     lookup.O
